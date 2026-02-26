@@ -93,6 +93,7 @@ class NewDecoder(Decoder):
             layers_per_block=2,
             norm_num_groups=32,
             act_fn="silu",
+            norm_type: str = "group",  # keep aligned with diffusers.Decoder (group|spatial)
     ):
         super().__init__()
         self.layers_per_block = layers_per_block
@@ -102,16 +103,20 @@ class NewDecoder(Decoder):
         self.mid_block = None
         self.up_blocks = nn.ModuleList([])
 
+        # In diffusers>=0.24, UNetMidBlock2D/get_up_block use `attention_head_dim` instead of
+        # the older `attn_num_head_channels`. Keep this decoder compatible with the installed diffusers.
+        temb_channels = in_channels if norm_type == "spatial" else None
+
         # mid
         self.mid_block = UNetMidBlock2D(
             in_channels=block_out_channels[-1],
             resnet_eps=1e-6,
             resnet_act_fn=act_fn,
-            output_scale_factor=1,
-            resnet_time_scale_shift="default",
-            attn_num_head_channels=None,
+            output_scale_factor=1.0,
+            resnet_time_scale_shift="default" if norm_type == "group" else norm_type,
+            attention_head_dim=block_out_channels[-1],
             resnet_groups=norm_num_groups,
-            temb_channels=None,
+            temb_channels=temb_channels,
         )
 
         # up
@@ -133,8 +138,9 @@ class NewDecoder(Decoder):
                 resnet_eps=1e-6,
                 resnet_act_fn=act_fn,
                 resnet_groups=norm_num_groups,
-                attn_num_head_channels=None,
-                temb_channels=None,
+                attention_head_dim=output_channel,
+                temb_channels=temb_channels,
+                resnet_time_scale_shift=norm_type,
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel

@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Experiment artifacts: keep manifests/results tracked, but ignore copied image trees
+exp/**/real/
+exp/**/fake/
+exp/**/real_by_subset/
+exp/**/fake_by_subset/
+exp/**/fake_100x7/

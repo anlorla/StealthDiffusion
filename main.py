@@ -18,17 +18,18 @@ import random
 from natsort import ns, natsorted
 import argparse
 import other_attacks
+from pathlib import Path
 
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--save_dir',
-                    default="/path/to/advdataset",
+                    default="/root/gpufree-data/dataset/genimage_adversial",
                     type=str, help='Where to save the adversarial examples, and other results')
 parser.add_argument('--mode',
                     default="double",
                     type=str, help='')
 parser.add_argument('--images_root',
-                    default="/path/to/dataset",
+                    default="/root/gpufree-data/dataset/test/genimage/fake",
                     type=str, help='The clean images root directory')
 parser.add_argument('--pretrained_diffusion_path',
                     default="stabilityai/stable-diffusion-2-1-base",
@@ -52,12 +53,20 @@ parser.add_argument('--dataset_name',
                     help='The dataset name for generating adversarial examples')
 parser.add_argument('--is_encoder', default=1, type=int)
 parser.add_argument('--encoder_weights',
-                    default="./checkpoints/Controlvae.pt",
+                    default="/root/gpufree-data/checkpoints/Controlvae.pt",
                     type=str)
 
 parser.add_argument('--guidance', default=0., type=float, help='guidance scale of diffusion models')
 parser.add_argument('--eps', default=4 / 255, type=float, help='guidance scale of diffusion models')
 parser.add_argument('--attack_loss_weight', default=10, type=int, help='attack loss weight factor')
+parser.add_argument('--pgd_steps', default=10, type=int, help='PGD steps for initializing perturbations')
+parser.add_argument('--pgd_alpha', default=None, type=float, help='PGD step size (default: eps/pgd_steps)')
+parser.add_argument('--lambda_l1', default=1.0, type=float, help='L1 loss coefficient (paper: alpha)')
+parser.add_argument('--lambda_lpips', default=1.0, type=float, help='LPIPS loss coefficient (paper: beta)')
+parser.add_argument('--lambda_latent', default=0.0, type=float, help='Latent L1 regularization coefficient (not in paper; default 0)')
+parser.add_argument('--attack_only_fake', default=1, type=int, help='If 1, only craft adversarial examples for fake images')
+parser.add_argument('--max_per_source', default=0, type=int, help='If >0, sample up to N fake images per generator/source (paper: 100)')
+parser.add_argument('--seed', default=42, type=int, help='Random seed used for sampling')
 
 def seed_torch(seed=42):
     """For reproducibility"""
@@ -144,12 +153,95 @@ if __name__ == "__main__":
             "S":"swin-t",
             }
 
-    "Attack a subset images"
-    all_images = glob.glob(os.path.join(images_root, "*"))
+    # Collect image files. Datasets may store images under `fake/` and `real/` subfolders.
+    # We support:
+    # - pointing `--images_root` at a single class folder (labels inferred as constant)
+    # - pointing `--images_root` at a parent folder containing both classes (labels inferred per-path)
+    img_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+    root = Path(images_root)
+    if root.is_file():
+        all_images = [str(root)]
+    else:
+        # Recurse so `--images_root .../fake` works when images are stored under
+        # `fake/<subset>/*.png` (GenImage-style layout).
+        all_images = [
+            str(p)
+            for p in root.rglob("*")
+            if p.is_file() and p.suffix.lower() in img_exts
+        ]
     all_images = natsorted(all_images, alg=ns.PATH)
+    if len(all_images) == 0:
+        subdirs = []
+        if root.is_dir():
+            subdirs = [p.name for p in root.iterdir() if p.is_dir()]
+        raise FileNotFoundError(
+            f"No image files found under images_root={images_root!r}. "
+            "Point --images_root at a folder containing images (or a single image file). "
+            + (f"Subdirectories found: {subdirs}. " if subdirs else "")
+            + "If your dataset is split into subfolders, pass e.g. "
+            "`--images_root /path/to/genimage/fake`."
+        )
 
+    # Infer labels from path components.
+    # Convention used in this repo: `fake` -> 0 (ai), `real` -> 1 (nature).
+    def _infer_label(p: str) -> int:
+        parts = [x.lower() for x in Path(p).parts]
+        # Accept folders like `fake/`, `fake_100x6/`, `fake_by_subset/` for convenience.
+        has_fake = any(x == "fake" or x.startswith("fake") for x in parts)
+        has_real = any(x == "real" or x.startswith("real") for x in parts)
+        if has_fake and not has_real:
+            return 0
+        if has_real and not has_fake:
+            return 1
+        raise ValueError(
+            f"Can't infer label from path {p!r}. Expected one of path components to be 'fake' or 'real'."
+        )
 
-    label = np.zeros(len(all_images))
+    label = np.array([_infer_label(p) for p in all_images], dtype=np.int64)
+
+    def _infer_source(p: str) -> str:
+        """
+        Best-effort generator/source inference for GenImage fake images.
+        If filename contains one of known substrings, use it; otherwise fall back to a token.
+        """
+        name = Path(p).name.lower()
+        # Keep this list small but practical for GenImage naming patterns.
+        known = [
+            "biggan",
+            "gaugan",
+            "glide",
+            "ldm",
+            "sdv4",
+            "wukong",
+            "midjourney",
+            "adm",
+            "vqdm",
+        ]
+        for k in known:
+            if k in name:
+                return k
+        parts = name.split("_")
+        return parts[1] if len(parts) >= 2 else "unknown"
+
+    # Match paper protocol: craft adversarial examples for fake images (ai) and evaluate transfer to others.
+    if args.attack_only_fake:
+        keep = [i for i, y in enumerate(label) if int(y) == 0]
+        all_images = [all_images[i] for i in keep]
+        label = label[keep]
+
+    # Optional: sample a fixed number of fake images per source/generator (paper: 100 per validation set).
+    if args.max_per_source and args.max_per_source > 0:
+        rng = random.Random(args.seed)
+        groups = {}
+        for p in all_images:
+            groups.setdefault(_infer_source(p), []).append(p)
+        sampled = []
+        for k in sorted(groups.keys()):
+            imgs = groups[k][:]
+            rng.shuffle(imgs)
+            sampled.extend(imgs[: args.max_per_source])
+        all_images = natsorted(sampled, alg=ns.PATH)
+        label = np.array([_infer_label(p) for p in all_images], dtype=np.int64)
 
     adv_images = []
     images = []

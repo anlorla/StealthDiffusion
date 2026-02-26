@@ -1,0 +1,5 @@
+seed=42
+mode=symlink
+real_k=700
+fake_sample_dir=exp/genimage_prepared_v2/fake_100x7
+real_dir=/root/gpufree-data/dataset/test/genimage/real
