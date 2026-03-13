@@ -47,8 +47,8 @@ Equivalent idea to `A_downsample_attack.py`:
 ```bash
 python scripts/run_baseline_attack.py \
   --attack downup \
-  --images_root exp/genimage_eval_700/fake \
-  --save_dir /root/gpufree-data/dataset/baseline_downup_surS_700 \
+  --images_root /root/gpufree-data/dataset/original_genimage_eval_1400/fake \
+  --save_dir /root/gpufree-data/dataset/StealthDiffusion/attack_out/baseline_downup_surS_700 \
   --model_name "S,E,R,D" \
   --res 224 \
   --scale_w 0.5 --scale_h 0.75 \
@@ -62,8 +62,8 @@ Equivalent idea to `A_FGSM.py`:
 ```bash
 python scripts/run_baseline_attack.py \
   --attack fgsm \
-  --images_root exp/genimage_eval_700/fake \
-  --save_dir /root/gpufree-data/dataset/baseline_fgsm_surS_700 \
+  --images_root /root/gpufree-data/dataset/original_genimage_eval_1400/fake \
+  --save_dir /root/gpufree-data/dataset/StealthDiffusion/attack_out/baseline_fgsm_surS_700 \
   --model_name "S,E,R,D" \
   --res 224 \
   --eps 0.01568627 \
@@ -77,8 +77,8 @@ Equivalent idea to `A_PGD.py`:
 ```bash
 python scripts/run_baseline_attack.py \
   --attack pgd \
-  --images_root exp/genimage_eval_700/fake \
-  --save_dir /root/gpufree-data/dataset/baseline_pgd_surS_700 \
+  --images_root /root/gpufree-data/dataset/original_genimage_eval_1400/fake \
+  --save_dir /root/gpufree-data/dataset/StealthDiffusion/attack_out/baseline_pgd_surS_700 \
   --model_name "S,E,R,D" \
   --res 224 \
   --eps 0.01568627 \
@@ -93,9 +93,9 @@ Build a dataroot:
 
 ```bash
 python scripts/build_adv_dataroot.py \
-  --clean_dataroot exp/genimage_eval_700 \
-  --attack_out /root/gpufree-data/dataset/baseline_pgd_surS_700 \
-  --out_dataroot exp/genimage_eval_700_adv_pgd_surS \
+  --clean_dataroot /root/gpufree-data/dataset/original_genimage_eval_1400 \
+  --attack_out /root/gpufree-data/dataset/StealthDiffusion/attack_out/baseline_pgd_surS_700 \
+  --out_dataroot /root/gpufree-data/dataset/StealthDiffusion/attack_datasets/baseline_pgd_original_genimage_eval_1400_surS \
   --mode symlink
 ```
 
@@ -103,7 +103,7 @@ Evaluate and export per-image logits:
 
 ```bash
 python scripts/eval_detectors.py \
-  --dataroot exp/genimage_eval_700_adv_pgd_surS \
+  --dataroot /root/gpufree-data/dataset/StealthDiffusion/attack_datasets/baseline_pgd_original_genimage_eval_1400_surS \
   --models E,R,D,S \
   --batch 32 \
   --out_csv exp/results/adv_logits_pgd_surS.csv
@@ -113,13 +113,20 @@ python scripts/eval_detectors.py \
 
 We provide a wrapper that runs DiffAttack code on our dataset while using our detectors (E/R/D/S) as surrogate.
 
+Assumption: DiffAttack repo is available at one of:
+
+- `./third_party/DiffAttack` (recommended for reproducibility)
+- `$DIFFATTACK_ROOT`
+- `/root/gpufree-data/DiffAttack` (legacy local path)
+
 Generate adversarial fakes (surrogate=S by default):
 
 ```bash
 python scripts/run_diffattack_baseline.py \
-  --images_root exp/genimage_eval_700/fake \
-  --save_dir /root/gpufree-data/dataset/baseline_diffattack_surS_700 \
+  --images_root /root/gpufree-data/dataset/original_genimage_eval_1400/fake \
+  --save_dir /root/gpufree-data/dataset/DiffAttack/attack_out/DiffAttack_original_genimage_eval_1400_surS \
   --model_name S \
+  --dataset_name ours_try \
   --pretrained_diffusion_path stabilityai/stable-diffusion-2-1-base \
   --res 224 \
   --diffusion_steps 20 --start_step 18 --iterations 5 \
@@ -133,13 +140,13 @@ Then reuse the same post-attack mapping + eval pipeline:
 
 ```bash
 python scripts/build_adv_dataroot.py \
-  --clean_dataroot exp/genimage_eval_700 \
-  --attack_out /root/gpufree-data/dataset/baseline_diffattack_surS_700 \
-  --out_dataroot exp/genimage_eval_700_adv_diffattack_surS \
+  --clean_dataroot /root/gpufree-data/dataset/original_genimage_eval_1400 \
+  --attack_out /root/gpufree-data/dataset/DiffAttack/attack_out/DiffAttack_original_genimage_eval_1400_surS \
+  --out_dataroot /root/gpufree-data/dataset/DiffAttack/attack_datasets/DiffAttack_original_genimage_eval_1400_adv_surS \
   --mode symlink
 
 python scripts/eval_detectors.py \
-  --dataroot exp/genimage_eval_700_adv_diffattack_surS \
+  --dataroot /root/gpufree-data/dataset/DiffAttack/attack_datasets/DiffAttack_original_genimage_eval_1400_adv_surS \
   --models E,R,D,S \
   --batch 32 \
   --out_csv exp/results/adv_logits_diffattack_surS.csv

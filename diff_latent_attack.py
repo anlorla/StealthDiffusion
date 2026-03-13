@@ -2,6 +2,7 @@ import os
 # os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 import numpy as np
 import torch
+from pathlib import Path
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
@@ -278,6 +279,7 @@ def diffattack(
     mode=None,
     idx=0,
     adm=None,
+    out_path_adv=None,
 ):
     if args.dataset_name == "ours_try":
         from dataset_caption import ours_label as imagenet_label
@@ -806,7 +808,17 @@ def diffattack(
         denorm_img.detach().cpu().numpy()[0].transpose(1, 2, 0) * 255.0, 0, 255
     ).astype(np.uint8)
 
-    Image.fromarray(imgg).save(save_path + "_adv_image.png")
+    # Save adversarial image.
+    # Legacy behavior: save to f"{save_path}_adv_image.png" (save_path is a prefix).
+    # New behavior: if out_path_adv is provided, save to that exact path.
+    out_p = None
+    if out_path_adv:
+        out_p = Path(out_path_adv)
+    elif save_path:
+        out_p = Path(save_path + "_adv_image.png")
+    if out_p is not None:
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(imgg).save(str(out_p))
 
     real = (init_image_compare / 2 + 0.5).clamp(0, 1)
     real_np = (

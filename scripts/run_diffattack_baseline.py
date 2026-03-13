@@ -25,8 +25,6 @@ import numpy as np
 from natsort import natsorted, ns
 from PIL import Image
 
-from loggers import Logger
-
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -39,10 +37,13 @@ def collect_images(images_root: str) -> list[str]:
     return natsorted(paths, alg=ns.PATH)
 
 
-def inject_binary_imagenet_label() -> None:
+def _maybe_inject_binary_imagenet_label() -> None:
     """
-    DiffAttack uses `from dataset_caption import imagenet_label` when dataset_name=imagenet_compatible.
-    We inject a minimal 2-class mapping so prompts are meaningful for forensic setting.
+    Compatibility fallback.
+
+    If DiffAttack doesn't support our 2-class dataset_caption (ours_try/ours_label),
+    we can still run with dataset_name=imagenet_compatible but inject a 2-class imagenet_label
+    so the prompt construction remains meaningful for our forensic setting.
     """
     pkg = types.ModuleType("dataset_caption")
     pkg.__path__ = []  # mark as package
@@ -50,8 +51,52 @@ def inject_binary_imagenet_label() -> None:
     mod.Label = {0: "ai", 1: "nature"}
     mod.refined_Label = {0: "ai", 1: "nature"}
     pkg.imagenet_label = mod
-    sys.modules["dataset_caption"] = pkg
+    sys.modules.setdefault("dataset_caption", pkg)
     sys.modules["dataset_caption.imagenet_label"] = mod
+
+
+def load_labels(
+    images: list[str],
+    *,
+    label_path: str | None,
+    dataset_name: str,
+) -> np.ndarray:
+    """
+    Keep the label semantics consistent with DiffAttack/main.py:
+    - imagenet_compatible labels are 1-based in files and need -1
+    - ours_try labels are already 0/1
+    """
+    if not label_path:
+        # Fake-only baseline: label=0 (ai) for all images.
+        return np.zeros((len(images),), dtype=np.int64)
+
+    p = Path(label_path)
+    raw: list[int] = []
+    for line in p.read_text().splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        raw.append(int(s))
+
+    if len(raw) != len(images):
+        raise ValueError(f"label count ({len(raw)}) != image count ({len(images)}). label_path={label_path!r}")
+
+    if dataset_name == "ours_try":
+        return np.asarray(raw, dtype=np.int64)
+    return (np.asarray(raw, dtype=np.int64) - 1).astype(np.int64)
+
+
+def resolve_diffattack_root(repo_root: Path, diffattack_root_arg: str | None) -> Path:
+    # Priority: CLI arg > env var > vendored path > legacy absolute path.
+    if diffattack_root_arg:
+        return Path(diffattack_root_arg)
+    env = os.environ.get("DIFFATTACK_ROOT")
+    if env:
+        return Path(env)
+    vendored = repo_root / "third_party" / "DiffAttack"
+    if vendored.exists():
+        return vendored
+    return Path("/root/gpufree-data/DiffAttack")
 
 
 def main() -> int:
@@ -59,6 +104,22 @@ def main() -> int:
     ap.add_argument("--images_root", required=True, help="Fake images root (can contain subset subfolders)")
     ap.add_argument("--save_dir", required=True, help="Output folder")
     ap.add_argument("--model_name", default="S", help="Surrogate detector name: one of {S,E,R,D}")
+    ap.add_argument(
+        "--dataset_name",
+        default="ours_try",
+        choices=["ours_try", "imagenet_compatible", "cub_200_2011", "standford_car"],
+        help="DiffAttack dataset_name; use ours_try for our 2-class (ai/nature) forensic setting",
+    )
+    ap.add_argument(
+        "--label_path",
+        default=None,
+        help="Optional labels file aligned with the sorted image list. If omitted, assume all label=0 (fake/ai).",
+    )
+    ap.add_argument(
+        "--diffattack_root",
+        default=None,
+        help="Path to DiffAttack repo. If omitted: $DIFFATTACK_ROOT or ./third_party/DiffAttack or /root/gpufree-data/DiffAttack",
+    )
     ap.add_argument("--pretrained_diffusion_path", default="stabilityai/stable-diffusion-2-1-base")
     ap.add_argument("--diffusion_steps", type=int, default=20)
     ap.add_argument("--start_step", type=int, default=18)
@@ -72,23 +133,25 @@ def main() -> int:
     ap.add_argument("--num_images", type=int, default=0, help=">0: only first N images")
     args = ap.parse_args()
 
+    # Ensure repo root is importable even when invoked as `python scripts/xxx.py`.
+    repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo_root))
+    from loggers import Logger  # noqa: E402
+
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     logger = Logger(name="diffattack_baseline", log_path=str(save_dir / "diffattack_baseline.log"))
 
     # 1) Import our detectors as `other_attacks` for DiffAttack to use.
     # Ensure our repo root is importable before adding DiffAttack path.
-    repo_root = Path(__file__).resolve().parents[1]
-    sys.path.insert(0, str(repo_root))
     import other_attacks as our_other_attacks  # noqa: E402
 
     # 2) Put DiffAttack repo at the front so its `utils.py`, `distances.py`, etc are used.
-    diffattack_root = Path("/root/gpufree-data/DiffAttack")
+    diffattack_root = resolve_diffattack_root(repo_root, args.diffattack_root)
     sys.path.insert(0, str(diffattack_root))
 
     # 3) Inject modules to avoid name collisions / change behavior.
     sys.modules["other_attacks"] = our_other_attacks
-    inject_binary_imagenet_label()
 
     # Now we can import DiffAttack modules safely.
     from diffusers import StableDiffusionPipeline, DDIMScheduler  # noqa: E402
@@ -101,11 +164,25 @@ def main() -> int:
     if not images:
         raise FileNotFoundError(f"No images under {args.images_root!r}")
 
-    # Fake-only baseline: label=0 for all images.
-    labels = np.zeros((len(images),), dtype=np.int64)
+    # Prefer keeping DiffAttack logic intact: use its dataset_caption/{ours_label,imagenet_label,...}.
+    # If our customized "ours_try" isn't available, fall back to imagenet_compatible with a 2-class prompt mapping.
+    dataset_name = args.dataset_name
+    if dataset_name == "ours_try":
+        impl_path = diffattack_root / "diff_latent_attack.py"
+        if impl_path.exists():
+            src = impl_path.read_text(errors="ignore")
+            if "ours_try" not in src:
+                logger.warning(
+                    "DiffAttack repo doesn't support dataset_name=ours_try; falling back to imagenet_compatible."
+                )
+                dataset_name = "imagenet_compatible"
+                _maybe_inject_binary_imagenet_label()
+
+    labels = load_labels(images, label_path=args.label_path, dataset_name=dataset_name)
 
     logger.info(f"images_root={args.images_root} count={len(images)}")
     logger.info(f"surrogate={args.model_name}")
+    logger.info(f"dataset_name={dataset_name} label_path={args.label_path}")
     logger.info(
         f"diffusion_steps={args.diffusion_steps} start_step={args.start_step} iterations={args.iterations} "
         f"res={args.res} guidance={args.guidance}"
@@ -120,7 +197,7 @@ def main() -> int:
 
     # Build a lightweight args object consumed by DiffAttack implementation
     diff_args = types.SimpleNamespace(
-        dataset_name="imagenet_compatible",
+        dataset_name=dataset_name,
         res=args.res,
         is_apply_mask=False,
         is_hard_mask=False,
@@ -132,7 +209,7 @@ def main() -> int:
     # Run
     for idx, image_path in enumerate(images):
         img = Image.open(image_path).convert("RGB")
-        Image.Image.save(img, save_dir / f"{idx:04d}_originImage.png")
+        img.save(save_dir / f"{idx:04d}_originImage.png")
 
         controller = AttentionControlEdit(args.diffusion_steps, args.self_replace_steps, args.res)
         # DiffAttack will save to: save_path + "_adv_image.png"
@@ -162,4 +239,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

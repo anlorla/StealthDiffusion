@@ -12,6 +12,9 @@ from PIL import Image
 import numpy as np
 import os
 import glob
+import csv
+import shutil
+from datetime import datetime, timezone
 
 import random
 
@@ -23,13 +26,45 @@ from pathlib import Path
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--save_dir',
-                    default="/root/gpufree-data/dataset/genimage_adversial",
-                    type=str, help='Where to save the adversarial examples, and other results')
+                    default="/root/gpufree-data/artifacts/StealthDiffusion_attack_out_{name}",
+                    type=str, help='(LEGACY/flat) Where to save the index-based outputs like 0000_adv_image.png')
+parser.add_argument(
+    "--output_mode",
+    default="final",
+    choices=["final", "flat"],
+    type=str,
+    help="final: write a full dataroot (real/ + fake/<subset>/...) directly; flat: legacy index-based output",
+)
+parser.add_argument(
+    "--clean_dataroot",
+    default="/root/gpufree-data/dataset/original_genimage_eval_1400",
+    type=str,
+    help="Clean dataroot containing real/ and fake/ (used to build the final out_dataroot structure)",
+)
+parser.add_argument(
+    "--out_dataroot",
+    default="/root/gpufree-data/dataset/StealthDiffusion/attack_datasets/StealthDiffusion_original_genimage_eval_1400_adv_sur{surrogate}",
+    type=str,
+    help="(final) Output dataroot to create; supports {surrogate} and {name}",
+)
+parser.add_argument(
+    "--real_mode",
+    default="symlink",
+    choices=["symlink", "copy"],
+    type=str,
+    help="(final) How to place clean real images under out_dataroot/real",
+)
+parser.add_argument(
+    "--save_origin",
+    default=0,
+    type=int,
+    help="(final) If 1, also save per-image *_originImage.png into out_dataroot/_origin (not needed for evaluation)",
+)
 parser.add_argument('--mode',
                     default="double",
                     type=str, help='')
 parser.add_argument('--images_root',
-                    default="/root/gpufree-data/dataset/test/genimage/fake",
+                    default="/root/gpufree-data/dataset/original_genimage_eval_1400/fake",
                     type=str, help='The clean images root directory')
 parser.add_argument('--pretrained_diffusion_path',
                     default="stabilityai/stable-diffusion-2-1-base",
@@ -83,32 +118,42 @@ def seed_torch(seed=42):
 seed_torch(42)
 
 
-def run_diffusion_attack(image, label, diffusion_model, diffusion_steps, guidance=2.5, save_dir="", res=224,
-                         model_name="inception", start_step=15, iterations=30, classes=None, logger=None, args=None):
-    adv_image = None
-
-
-    for i in range(1):
-        if adv_image is None:
-            image = image.resize((res, res), resample=Image.LANCZOS)
-            adv_image, adv_acc, adv_acc1, adv_acc2, adv_acc3, psnr, ssim = diff_latent_attack.diffattack(diffusion_model, label,
-                                                                          num_inference_steps=diffusion_steps,
-                                                                          guidance_scale=guidance,
-                                                                          image=image, compare=image,
-                                                                          save_path=save_dir, res=res, model_name=model_name,
-                                                                          start_step=start_step, classes=classes,
-                                                                          iterations=iterations, logger=logger, args=args, idx=i)
-        else:
-            # image = adv_image
-            adv_image, adv_acc, adv_acc1, adv_acc2, adv_acc3, psnr, ssim = diff_latent_attack.diffattack(
-                diffusion_model, label, None,
-                num_inference_steps=diffusion_steps,
-                guidance_scale=guidance,
-                image=adv_image, compare=image,
-                save_path=save_dir, res=res, model_name=model_name,
-                start_step=start_step, classes=classes,
-                iterations=iterations, logger=logger, args=args, idx=i)
-
+def run_diffusion_attack(
+    image,
+    label,
+    diffusion_model,
+    diffusion_steps,
+    guidance=2.5,
+    out_path_adv=None,
+    save_dir="",
+    res=224,
+    model_name="inception",
+    start_step=15,
+    iterations=30,
+    classes=None,
+    logger=None,
+    args=None,
+):
+    # Note: the actual file save is handled inside diff_latent_attack.diffattack().
+    image = image.resize((res, res), resample=Image.LANCZOS)
+    adv_image, adv_acc, adv_acc1, adv_acc2, adv_acc3, psnr, ssim = diff_latent_attack.diffattack(
+        diffusion_model,
+        label,
+        num_inference_steps=diffusion_steps,
+        guidance_scale=guidance,
+        image=image,
+        compare=image,
+        save_path=save_dir,
+        out_path_adv=out_path_adv,
+        res=res,
+        model_name=model_name,
+        start_step=start_step,
+        classes=classes,
+        iterations=iterations,
+        logger=logger,
+        args=args,
+        idx=0,
+    )
     adv_image = np.array(adv_image)
     return adv_image, adv_acc, adv_acc1, adv_acc2, adv_acc3, psnr, ssim
 
@@ -130,10 +175,13 @@ if __name__ == "__main__":
     for model in model_name:
         name += model
     name += str(args.is_encoder)
-    save_dir = args.save_dir  # Where to save the adversarial examples, and other results.
-    save_dir = save_dir.format(name)
-    os.makedirs(save_dir, exist_ok=True)
-    logger = Logger(name='train', log_path='{}/{}.log'.format(save_dir, name))
+    surrogate = model_name[0]
+
+    # Logs go to exp/ (experiment records), not to the dataset folder.
+    repo_root = Path(__file__).resolve().parents[1]
+    log_dir = Path(__file__).resolve().parent / "exp" / "results"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger = Logger(name="train", log_path=str(log_dir / f"attack_{name}_sur{surrogate}.log"))
 
     images_root = args.images_root  # The clean images' root directory.
 
@@ -268,40 +316,205 @@ if __name__ == "__main__":
     classifier_supp2.requires_grad_(False)
 
     classes = [classifier, classifier_supp, classifier_supp1, classifier_supp2]
-    for ind, image_path in enumerate(all_images):
 
-        tmp_image = Image.open(image_path).convert('RGB')
-        tmp_image.save(os.path.join(save_dir, str(ind).rjust(4, '0') + "_originImage.png"))
+    # Output handling:
+    # - final: write a full dataroot structure directly under args.out_dataroot (no attack_out intermediate)
+    # - flat:  legacy index-based output under args.save_dir
+    output_mode = args.output_mode
+    clean_dataroot = Path(args.clean_dataroot)
 
-        adv_image, adv_acc, adv_acc1, adv_acc2, adv_acc3, psnrv, ssimv = run_diffusion_attack(tmp_image, label[ind:ind + 1],
-                                                             ldm_stable,
-                                                             diffusion_steps, guidance=guidance,
-                                                             res=res, model_name=model_name,
-                                                             classes=classes,
-                                                             start_step=start_step,
-                                                             iterations=iterations,
-                                                             logger=logger,
-                                                             save_dir=os.path.join(save_dir,
-                                                                                   str(ind).rjust(4, '0')), args=args)
+    def _format_path_template(tpl: str) -> str:
+        if "{" in tpl and "}" in tpl:
+            try:
+                return tpl.format(name=name, surrogate=surrogate)
+            except Exception:
+                return tpl
+        return tpl
 
-        adv_image = adv_image.astype(np.float32) / 255.0
-        adv_images.append(adv_image[None].transpose(0, 3, 1, 2))
+    def _iter_images(root_dir: Path) -> list[Path]:
+        img_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+        files: list[Path] = []
+        for p in root_dir.rglob("*"):
+            if p.is_file() and p.suffix.lower() in img_exts:
+                files.append(p)
+        files = natsorted([str(p) for p in files], alg=ns.PATH)
+        return [Path(p) for p in files]
 
-        tmp_image = tmp_image.resize((res, res), resample=Image.LANCZOS)
-        tmp_image = np.array(tmp_image).astype(np.float32) / 255.0
-        tmp_image = tmp_image[None].transpose(0, 3, 1, 2)
-        images.append(tmp_image)
+    def _link_or_copy(src: Path, dst: Path, mode: str) -> None:
+        if dst.exists() or dst.is_symlink():
+            return
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if mode == "symlink":
+            rel = os.path.relpath(src, start=dst.parent)
+            os.symlink(rel, dst)
+        elif mode == "copy":
+            shutil.copy2(src, dst)
+        else:
+            raise ValueError(f"Unknown real_mode: {mode}")
 
+    manifest_real = None
+    manifest_fake = None
+    manifest_fake_adv = None
+    out_dataroot = None
 
-        adv_all_acc += adv_acc
-        adv_all_acc1 += adv_acc1
-        adv_all_acc2 += adv_acc2
-        adv_all_acc3 += adv_acc3
-        psnrss.append(psnrv)
-        ssimss.append(ssimv)
-        logger.info('final PSNR: {:.2f} dB; final SSIM: {:.4f}.'.format(psnrv, ssimv))
+    if output_mode == "final":
+        out_dataroot = Path(_format_path_template(args.out_dataroot))
+        if out_dataroot.exists() or out_dataroot.is_symlink():
+            raise FileExistsError(f"out_dataroot already exists: {out_dataroot}")
+        (out_dataroot / "real").mkdir(parents=True, exist_ok=True)
+        (out_dataroot / "fake").mkdir(parents=True, exist_ok=True)
 
+        # Real: link/copy from clean dataroot
+        real_src = clean_dataroot / "real"
+        real_files = _iter_images(real_src)
+        manifest_real = out_dataroot / "manifest_real.csv"
+        with manifest_real.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["src", "dst"])
+            for p in real_files:
+                src = p.resolve()
+                dst = out_dataroot / "real" / p.name
+                _link_or_copy(src, dst, args.real_mode)
+                try:
+                    w.writerow([str(src.relative_to(repo_root)), str(dst.relative_to(repo_root))])
+                except Exception:
+                    w.writerow([str(src), str(dst)])
 
+        manifest_fake = out_dataroot / "manifest_fake.csv"
+        manifest_fake_adv = out_dataroot / "manifest_fake_adv.csv"
+        with manifest_fake.open("w", newline="") as f_fake, manifest_fake_adv.open("w", newline="") as f_adv:
+            w_fake = csv.writer(f_fake)
+            w_adv = csv.writer(f_adv)
+            w_fake.writerow(["src", "dst"])
+            w_adv.writerow(["idx", "clean_path", "adv_path", "out_path"])
+
+            fake_root_clean = clean_dataroot / "fake"
+            images_root_p = Path(images_root)
+
+            for ind, image_path in enumerate(all_images):
+                in_p = Path(image_path)
+                tmp_image = Image.open(image_path).convert("RGB")
+
+                # Compute output relative path under fake/.
+                rel = None
+                if fake_root_clean.exists():
+                    try:
+                        rel = in_p.relative_to(fake_root_clean)
+                    except Exception:
+                        rel = None
+                if rel is None:
+                    try:
+                        rel = in_p.relative_to(images_root_p)
+                    except Exception:
+                        rel = Path(in_p.name)
+
+                out_p = out_dataroot / "fake" / rel
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+
+                if args.save_origin:
+                    origin_p = out_dataroot / "_origin" / rel
+                    origin_p.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_image.save(str(origin_p))
+
+                adv_image, adv_acc, adv_acc1, adv_acc2, adv_acc3, psnrv, ssimv = run_diffusion_attack(
+                    tmp_image,
+                    label[ind : ind + 1],
+                    ldm_stable,
+                    diffusion_steps,
+                    guidance=guidance,
+                    res=res,
+                    model_name=model_name,
+                    classes=classes,
+                    start_step=start_step,
+                    iterations=iterations,
+                    logger=logger,
+                    args=args,
+                    out_path_adv=str(out_p),
+                    save_dir="",
+                )
+
+                adv_all_acc += adv_acc
+                adv_all_acc1 += adv_acc1
+                adv_all_acc2 += adv_acc2
+                adv_all_acc3 += adv_acc3
+                psnrss.append(psnrv)
+                ssimss.append(ssimv)
+                logger.info("final PSNR: {:.2f} dB; final SSIM: {:.4f}.".format(psnrv, ssimv))
+
+                clean_p = (fake_root_clean / rel) if fake_root_clean.exists() else in_p
+
+                try:
+                    clean_s = str(clean_p.relative_to(repo_root))
+                except Exception:
+                    clean_s = str(clean_p)
+                try:
+                    out_s = str(out_p.relative_to(repo_root))
+                except Exception:
+                    out_s = str(out_p)
+
+                w_fake.writerow([out_s, out_s])
+                w_adv.writerow([ind, clean_s, out_s, out_s])
+
+        meta = out_dataroot / "meta.txt"
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        meta.write_text(
+            "\n".join(
+                [
+                    f"created_utc={now}",
+                    f"baseline=StealthDiffusion",
+                    f"surrogate={surrogate}",
+                    f"mode=final",
+                    f"clean_dataroot={clean_dataroot.resolve()}",
+                    f"images_root={Path(images_root).resolve()}",
+                    f"real_mode={args.real_mode}",
+                    f"n_real={len(_iter_images(clean_dataroot / 'real')) if (clean_dataroot / 'real').exists() else 0}",
+                    f"n_fake={len(all_images)}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    else:
+        # Legacy flat output.
+        save_dir = _format_path_template(args.save_dir)
+        os.makedirs(save_dir, exist_ok=True)
+        logger.info(f"flat save_dir={save_dir}")
+
+        for ind, image_path in enumerate(all_images):
+            tmp_image = Image.open(image_path).convert("RGB")
+            if args.save_origin:
+                tmp_image.save(os.path.join(save_dir, str(ind).rjust(4, "0") + "_originImage.png"))
+
+            out_p = os.path.join(save_dir, str(ind).rjust(4, "0") + "_adv_image.png")
+            adv_image, adv_acc, adv_acc1, adv_acc2, adv_acc3, psnrv, ssimv = run_diffusion_attack(
+                tmp_image,
+                label[ind : ind + 1],
+                ldm_stable,
+                diffusion_steps,
+                guidance=guidance,
+                res=res,
+                model_name=model_name,
+                classes=classes,
+                start_step=start_step,
+                iterations=iterations,
+                logger=logger,
+                save_dir="",
+                args=args,
+                out_path_adv=out_p,
+            )
+
+            adv_all_acc += adv_acc
+            adv_all_acc1 += adv_acc1
+            adv_all_acc2 += adv_acc2
+            adv_all_acc3 += adv_acc3
+            psnrss.append(psnrv)
+            ssimss.append(ssimv)
+            logger.info("final PSNR: {:.2f} dB; final SSIM: {:.4f}.".format(psnrv, ssimv))
+
+    logger.info(f"output_mode={output_mode}")
+    if out_dataroot is not None:
+        logger.info(f"out_dataroot={out_dataroot}")
     logger.info("Adv acc: {}%".format(adv_all_acc / len(all_images) * 100))
     logger.info("Adv acc1: {}%".format(adv_all_acc1 / len(all_images) * 100))
     logger.info("Adv acc2: {}%".format(adv_all_acc2 / len(all_images) * 100))

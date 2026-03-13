@@ -53,7 +53,7 @@ Count and sample fake subsets (7 subsets x 100 = 700):
 ```bash
 python scripts/prepare_genimage_subsets.py \
   --fake_dir /root/gpufree-data/dataset/test/genimage/fake \
-  --out_dir exp/genimage_prepared_v2 \
+  --out_dir /root/gpufree-data/dataset/StealthDiffusion/genimage_prepared_v2 \
   --k 100 --n_sets 7 --seed 42 --mode symlink
 ```
 
@@ -61,10 +61,10 @@ Create a balanced eval dataroot with 700 real + 700 fake:
 
 ```bash
 python scripts/prepare_genimage_eval.py \
-  --fake_sample_dir exp/genimage_prepared_v2/fake_100x7 \
+  --fake_sample_dir /root/gpufree-data/dataset/StealthDiffusion/genimage_prepared_v2/fake_100x7 \
   --real_dir /root/gpufree-data/dataset/test/genimage/real \
   --real_k 700 --seed 42 \
-  --out_dir exp/genimage_eval_700 \
+  --out_dir /root/gpufree-data/dataset/original_genimage_eval_1400 \
   --mode symlink
 ```
 
@@ -72,7 +72,7 @@ python scripts/prepare_genimage_eval.py \
 
 ```bash
 python scripts/eval_detectors.py \
-  --dataroot exp/genimage_eval_700 \
+  --dataroot /root/gpufree-data/dataset/original_genimage_eval_1400 \
   --models E,R,D,S \
   --batch 32 \
   --out_csv exp/results/clean_logits.csv
@@ -93,8 +93,10 @@ Run attack (craft adv for fake only):
 
 ```bash
 python main.py \
-  --images_root exp/genimage_eval_700/fake \
-  --save_dir /root/gpufree-data/dataset/genimage_adversial_surS_700 \
+  --images_root /root/gpufree-data/dataset/original_genimage_eval_1400/fake \
+  --output_mode final \
+  --clean_dataroot /root/gpufree-data/dataset/original_genimage_eval_1400 \
+  --out_dataroot /root/gpufree-data/dataset/StealthDiffusion/attack_datasets/StealthDiffusion_original_genimage_eval_1400_adv_surS \
   --attack_only_fake 1 \
   --model_name "S,E,R,D" \
   --res 224 \
@@ -105,33 +107,21 @@ python main.py \
   --is_encoder 1
 ```
 
-## 3) Build post-attack dataroot: real(clean) + fake(adv)
-
-This step “maps” `0000_adv_image.png` back under `fake/<subset>/...` to preserve subset structure and allow evaluation.
-
-```bash
-python scripts/build_adv_dataroot.py \
-  --clean_dataroot exp/genimage_eval_700 \
-  --attack_out /root/gpufree-data/dataset/genimage_adversial_surR_700 \
-  --out_dataroot exp/genimage_eval_700_adv_surR \
-  --mode symlink
-```
-
-## 4) Post-attack evaluation
+## 3) Post-attack evaluation
 
 ```bash
 python scripts/eval_detectors.py \
-  --dataroot exp/genimage_eval_700_adv_surR \
+  --dataroot /root/gpufree-data/dataset/StealthDiffusion/attack_datasets/StealthDiffusion_original_genimage_eval_1400_adv_surS \
   --models E,R,D,S \
   --batch 32 \
-  --out_csv exp/results/adv_logits_surR.csv
+  --out_csv exp/results/adv_logits_surS.csv
 ```
 
 Compare `exp/results/clean_logits.csv` vs `exp/results/adv_logits_surS.csv`.
 
 ## 5) Full 4x3 transfer ASR matrix (requires 4 runs)
 
-Repeat steps (2)-(4) for each surrogate:
+Repeat steps (2)-(3) for each surrogate:
 - surrogate E: `--model_name "E,R,D,S"` -> `adv_logits_surE.csv`
 - surrogate R: `--model_name "R,E,D,S"` -> `adv_logits_surR.csv`
 - surrogate D: `--model_name "D,E,R,S"` -> `adv_logits_surD.csv`
@@ -152,5 +142,4 @@ python scripts/transfer_asr_matrix.py \
 ## Notes / gotchas
 
 - GPU: evaluation on CPU can be very slow; if CUDA is available, the scripts will use it automatically.
-- Ordering: `build_adv_dataroot.py` assumes the attack output indices `0000,0001,...` match `natsorted(clean_dataroot/fake/**)`. So always run `main.py` on the same `clean_dataroot/fake` you later pass to `build_adv_dataroot.py`.
-
+- Output: `main.py --output_mode final` writes the final dataroot directly (no `attack_out` intermediate), preserving `fake/<subset>/...` relative paths from `clean_dataroot/fake`.
