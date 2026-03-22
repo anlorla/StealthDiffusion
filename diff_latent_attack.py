@@ -112,15 +112,157 @@ def preprocess(image, res=512, device=None, dtype=torch.float32):
     return 2.0 * image - 1.0
 
 
+def is_pixart_alpha_backbone(model):
+    return model.__class__.__name__ == "PixArtAlphaPipeline" or hasattr(model, "transformer")
+
+
+def get_denoiser(model):
+    return model.transformer if is_pixart_alpha_backbone(model) else model.unet
+
+
+def get_scaling_factor(model):
+    return float(getattr(model.vae.config, "scaling_factor", 0.18215) or 0.18215)
+
+
+def encode_prompt_embeddings(model, prompt):
+    prompt = prompt if isinstance(prompt, list) else [prompt]
+
+    if is_pixart_alpha_backbone(model):
+        (
+            prompt_embeds,
+            prompt_attention_mask,
+            negative_prompt_embeds,
+            negative_prompt_attention_mask,
+        ) = model.encode_prompt(
+            prompt,
+            do_classifier_free_guidance=True,
+            negative_prompt="",
+            num_images_per_prompt=1,
+            device=model.device,
+            clean_caption=False,
+        )
+        return {
+            "text_embeddings": prompt_embeds,
+            "text_attention_mask": prompt_attention_mask,
+            "uncond_embeddings": negative_prompt_embeds,
+            "uncond_attention_mask": negative_prompt_attention_mask,
+        }
+
+    batch_size = len(prompt)
+    max_length = 77
+    uncond_input = model.tokenizer(
+        [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt"
+    )
+    uncond_embeddings = model.text_encoder(uncond_input.input_ids.to(model.device))[0]
+
+    text_input = model.tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=model.tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    text_embeddings = model.text_encoder(text_input.input_ids.to(model.device))[0]
+    return {
+        "text_embeddings": text_embeddings,
+        "uncond_embeddings": uncond_embeddings,
+    }
+
+
+def build_added_cond_kwargs(model, height, width, batch_size, dtype, device):
+    if not is_pixart_alpha_backbone(model):
+        return None
+
+    sample_size = getattr(model.transformer.config, "sample_size", None)
+    if sample_size != 128:
+        return {"resolution": None, "aspect_ratio": None}
+
+    resolution = torch.tensor([height, width]).repeat(batch_size, 1).to(dtype=dtype, device=device)
+    aspect_ratio = torch.tensor([float(height / width)]).repeat(batch_size, 1).to(dtype=dtype, device=device)
+    return {"resolution": resolution, "aspect_ratio": aspect_ratio}
+
+
+def build_context(
+    model,
+    prompt,
+    res,
+    uncond_embeddings=None,
+    uncond_attention_mask=None,
+):
+    prompt = prompt if isinstance(prompt, list) else [prompt]
+    prompt_info = encode_prompt_embeddings(model, prompt)
+    text_embeddings = prompt_info["text_embeddings"]
+
+    if is_pixart_alpha_backbone(model):
+        if uncond_embeddings is None:
+            uncond_embeddings = prompt_info["uncond_embeddings"]
+        if uncond_attention_mask is None:
+            uncond_attention_mask = prompt_info["uncond_attention_mask"]
+
+        batch_size = text_embeddings.shape[0]
+        return {
+            "prompt_embeds": torch.cat([uncond_embeddings, text_embeddings], dim=0),
+            "prompt_attention_mask": torch.cat([uncond_attention_mask, prompt_info["text_attention_mask"]], dim=0),
+            "added_cond_kwargs": build_added_cond_kwargs(
+                model,
+                height=res,
+                width=res,
+                batch_size=batch_size,
+                dtype=text_embeddings.dtype,
+                device=text_embeddings.device,
+            ),
+        }
+
+    if uncond_embeddings is None:
+        uncond_embeddings = prompt_info["uncond_embeddings"]
+    return {
+        "encoder_hidden_states": torch.cat([uncond_embeddings, text_embeddings], dim=0),
+    }
+
+
+def get_model_prediction(model, latents, context, t, guidance_scale):
+    latent_model_input = torch.cat([latents] * 2)
+
+    if is_pixart_alpha_backbone(model):
+        latent_model_input = model.scheduler.scale_model_input(latent_model_input, t)
+
+        current_timestep = t
+        if not torch.is_tensor(current_timestep):
+            current_timestep = torch.tensor([current_timestep], dtype=torch.int64, device=latent_model_input.device)
+        elif len(current_timestep.shape) == 0:
+            current_timestep = current_timestep[None].to(latent_model_input.device)
+        current_timestep = current_timestep.expand(latent_model_input.shape[0])
+
+        noise_pred = model.transformer(
+            latent_model_input,
+            encoder_hidden_states=context["prompt_embeds"],
+            encoder_attention_mask=context["prompt_attention_mask"],
+            timestep=current_timestep,
+            added_cond_kwargs=context["added_cond_kwargs"],
+            return_dict=False,
+        )[0]
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        latent_channels = latents.shape[1]
+        if model.transformer.config.out_channels // 2 == latent_channels:
+            noise_pred = noise_pred.chunk(2, dim=1)[0]
+        return noise_pred
+
+    noise_pred = model.unet(latent_model_input, t, encoder_hidden_states=context["encoder_hidden_states"])["sample"]
+    noise_pred_uncond, noise_prediction_text = noise_pred.chunk(2)
+    return noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
+
+
 def encoder(image, model, res=512):
     """
-    用 VAE 的 device/dtype 做预处理，再把 latent 转成 UNet 的 dtype
+    用 VAE 的 device/dtype 做预处理，再把 latent 转成 denoiser 的 dtype
     """
     vae_param = next(model.vae.parameters())
-    unet_param = next(model.unet.parameters())
+    denoiser_param = next(get_denoiser(model).parameters())
     vae_device = vae_param.device
     vae_dtype = vae_param.dtype
-    unet_dtype = unet_param.dtype
+    denoiser_dtype = denoiser_param.dtype
 
     generator = torch.Generator(device=vae_device).manual_seed(8888)
     image = preprocess(image, res, device=vae_device, dtype=vae_dtype)
@@ -128,12 +270,11 @@ def encoder(image, model, res=512):
     gpu_generator = torch.Generator(device=vae_device)
     gpu_generator.manual_seed(generator.initial_seed())
 
-    latents = 0.18215 * model.vae.encode(image).latent_dist.sample(
+    latents = get_scaling_factor(model) * model.vae.encode(image).latent_dist.sample(
         generator=gpu_generator
     )
 
-    # latent 送给 UNet 前，转成 UNet 的 dtype
-    latents = latents.to(dtype=unet_dtype)
+    latents = latents.to(dtype=denoiser_dtype)
     return latents
 
 # def encoder(image, model, res=512):
@@ -164,26 +305,22 @@ def ddim_reverse_sample(
     ============ DDIM Inversion ==============
     ==========================================
     """
-    batch_size = 1
+    if is_pixart_alpha_backbone(model) and getattr(model, "inverse_scheduler", None) is not None:
+        model.scheduler.set_timesteps(num_inference_steps, device=model.device)
+        model.inverse_scheduler.set_timesteps(num_inference_steps, device=model.device)
 
-    max_length = 77
-    uncond_input = model.tokenizer(
-        [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt"
-    )
-    uncond_embeddings = model.text_encoder(uncond_input.input_ids.to(model.device))[0]
+        latents = encoder(image, model, res=res)
+        timesteps = model.inverse_scheduler.timesteps
+        context = build_context(model, [prompt[0]], res=res)
 
-    text_input = model.tokenizer(
-        prompt[0],
-        padding="max_length",
-        max_length=model.tokenizer.model_max_length,
-        truncation=True,
-        return_tensors="pt",
-    )
-    text_embeddings = model.text_encoder(text_input.input_ids.to(model.device))[0]
+        all_latents = [latents]
+        for t in tqdm(timesteps[1:], desc="DDIM_inverse"):
+            model_output = get_model_prediction(model, latents, context, t, guidance_scale)
+            latents = model.inverse_scheduler.step(model_output, t, latents)["prev_sample"]
+            all_latents.append(latents)
+        return latents, all_latents
 
-    context = [uncond_embeddings, text_embeddings]
-    context = torch.cat(context)
-
+    context = build_context(model, [prompt[0]], res=res)
     model.scheduler.set_timesteps(num_inference_steps)
 
     latents = encoder(image, model, res=res)
@@ -191,16 +328,8 @@ def ddim_reverse_sample(
 
     all_latents = [latents]
 
-    # Not inverse the last step, as the alpha_bar_next will be set to 0 which
-    # is not aligned to its real value (~0.003) and this will lead to a bad result.
     for t in tqdm(timesteps[:-1], desc="DDIM_inverse"):
-        latents_input = torch.cat([latents] * 2)
-        noise_pred = model.unet(latents_input, t, encoder_hidden_states=context)["sample"]
-
-        noise_pred_uncond, noise_prediction_text = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + guidance_scale * (
-            noise_prediction_text - noise_pred_uncond
-        )
+        noise_pred = get_model_prediction(model, latents, context, t, guidance_scale)
 
         next_timestep = (
             t + model.scheduler.config.num_train_timesteps // model.scheduler.num_inference_steps
@@ -211,7 +340,6 @@ def ddim_reverse_sample(
             else torch.tensor(0.0)
         )
 
-        # leverage reversed_x0
         reverse_x0 = (
             1 / torch.sqrt(model.scheduler.alphas_cumprod[t])
             * (latents - noise_pred * torch.sqrt(1 - model.scheduler.alphas_cumprod[t]))
@@ -228,30 +356,27 @@ def ddim_reverse_sample(
 
 
 def init_latent(latent, model, height, width, batch_size):
+    denoiser = get_denoiser(model)
     latents = latent.expand(
-        batch_size, model.unet.in_channels, height // 8, width // 8
+        batch_size, denoiser.config.in_channels, height // 8, width // 8
     ).to(model.device)
     return latent, latents
 
 
 def diffusion_step(model, latents, context, t, guidance_scale):
-    latents_input = torch.cat([latents] * 2)
-    noise_pred = model.unet(latents_input, t, encoder_hidden_states=context)["sample"]
-    noise_pred_uncond, noise_prediction_text = noise_pred.chunk(2)
-    noise_pred = noise_pred_uncond + guidance_scale * (
-        noise_prediction_text - noise_pred_uncond
-    )
+    noise_pred = get_model_prediction(model, latents, context, t, guidance_scale)
     latents = model.scheduler.step(noise_pred, t, latents)["prev_sample"]
     return latents
 
 
 def latent2image(vae, latents, args, decoder, down_features):
+    scaling_factor = float(getattr(vae.config, "scaling_factor", 0.18215) or 0.18215)
     if args.is_encoder == 1:
-        latents = 1 / 0.18215 * latents
+        latents = latents / scaling_factor
         latents = vae.post_quant_conv(latents)
         image = decoder(latents, down_features)
     else:
-        latents = 1 / 0.18215 * latents
+        latents = latents / scaling_factor
         image = vae.decode(latents)["sample"]
     image = (image / 2 + 0.5).clamp(0, 1)
     image = image.cpu().permute(0, 2, 3, 1).detach().numpy()
@@ -286,11 +411,11 @@ def diffattack(
     else:
         raise NotImplementedError
 
-    # VAE / UNet 精度 & device
-    unet_param = next(model.unet.parameters())
+    # VAE / denoiser 精度 & device
+    denoiser_param = next(get_denoiser(model).parameters())
     vae_param = next(model.vae.parameters())
-    device = unet_param.device
-    unet_dtype = unet_param.dtype
+    device = denoiser_param.device
+    denoiser_dtype = denoiser_param.dtype
     vae_dtype = vae_param.dtype
 
     label = torch.from_numpy(label).long().cuda()
@@ -400,9 +525,13 @@ def diffattack(
         f"prompt generate: {prompt[0]} \tlabels: {pred_labels.cpu().numpy().tolist()}"
     )
 
-    true_label = model.tokenizer.encode(imagenet_label.refined_Label[label.item()])
-    target_label = model.tokenizer.encode(target_prompt)
-    logger.info(f"decoder: {true_label}, {target_label}")
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is not None and hasattr(tokenizer, "encode"):
+        true_label = tokenizer.encode(imagenet_label.refined_Label[label.item()])
+        target_label = tokenizer.encode(target_prompt)
+        logger.info(f"decoder: {true_label}, {target_label}")
+    else:
+        logger.info("decoder token ids unavailable for current backbone")
 
     # ==========================================
     # ============ DDIM Inversion ==============
@@ -434,25 +563,13 @@ def diffattack(
 
     init_prompt = [""]
 
-    max_length = 77
     batch_size_init = len(init_prompt)
-    uncond_input = model.tokenizer(
-        [""] * batch_size_init,
-        padding="max_length",
-        max_length=max_length,
-        return_tensors="pt",
-    )
-    uncond_embeddings = model.text_encoder(uncond_input.input_ids.to(model.device))[0]
-
-    text_input = model.tokenizer(
-        init_prompt,
-        padding="max_length",
-        max_length=model.tokenizer.model_max_length,
-        truncation=True,
-        return_tensors="pt",
-    )
+    init_prompt_info = encode_prompt_embeddings(model, init_prompt)
+    uncond_embeddings = init_prompt_info["uncond_embeddings"]
+    uncond_attention_mask = init_prompt_info.get("uncond_attention_mask")
 
     all_uncond_emb = []
+    all_uncond_masks = []
     latent, latents = init_latent(latent, model, height, width, batch_size_init)
     with torch.no_grad():
         for k, z in enumerate(latents):
@@ -467,6 +584,8 @@ def diffattack(
         tqdm(model.scheduler.timesteps[1 + start_step - 1 :], desc="Optimize_uncond_embed")
     ):
         all_uncond_emb.append(uncond_embeddings.detach().clone())
+        if uncond_attention_mask is not None:
+            all_uncond_masks.append(uncond_attention_mask.detach().clone())
 
     # ==========================================
     # ============ Latents Attack ==============
@@ -474,21 +593,22 @@ def diffattack(
 
     batch_size = len(prompt)
 
-    text_input = model.tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=model.tokenizer.model_max_length,
-        truncation=True,
-        return_tensors="pt",
-    )
-    text_embeddings = model.text_encoder(text_input.input_ids.to(model.device))[0]
+    context = []
+    for i in range(len(all_uncond_emb)):
+        uncond_mask = None
+        if all_uncond_masks:
+            uncond_mask = all_uncond_masks[i].repeat(batch_size, 1)
+        context.append(
+            build_context(
+                model,
+                prompt,
+                res=height,
+                uncond_embeddings=all_uncond_emb[i].repeat(batch_size, 1, 1),
+                uncond_attention_mask=uncond_mask,
+            )
+        )
 
-    context = [
-        torch.cat([all_uncond_emb[i].repeat(batch_size, 1, 1), text_embeddings], dim=0)
-        for i in range(len(all_uncond_emb))
-    ]
-
-    model.unet.requires_grad_(False)
+    get_denoiser(model).requires_grad_(False)
     model.vae.requires_grad_(False)
 
 
@@ -575,8 +695,8 @@ def diffattack(
 
         latents = torch.cat(
             [
-                original_latent,                # fp16
-                latent_opt.to(dtype=unet_dtype) # 转成 UNet 的 dtype
+                original_latent,
+                latent_opt.to(dtype=denoiser_dtype)
             ],
             dim=0,
         )
@@ -598,7 +718,7 @@ def diffattack(
                 latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
             latents = latents.clamp_(-5.0, 5.0)
 
-        decode_latents = (1 / 0.18215 * latents).to(dtype=vae_dtype)
+        decode_latents = (latents / get_scaling_factor(model)).to(dtype=vae_dtype)
 
         if torch.isnan(decode_latents).any() or torch.isinf(decode_latents).any():
             logger.warning("decode_latents has NaN/Inf, cleaning.")
@@ -673,7 +793,7 @@ def diffattack(
         latents = torch.cat(
             [
                 original_latent,
-                latent_opt.to(dtype=unet_dtype),
+                latent_opt.to(dtype=denoiser_dtype),
             ],
             dim=0,
         )
@@ -736,7 +856,7 @@ def diffattack(
         down_features = newencoder(init_image1)[1]
 
         decode_latents = model.vae.post_quant_conv(
-            (1 / 0.1825 * latents).to(dtype=vae_dtype)
+            (latents / get_scaling_factor(model)).to(dtype=vae_dtype)
         )
         decode_latents = torch.nan_to_num(
             decode_latents, nan=0.0, posinf=5.0, neginf=-5.0
@@ -748,7 +868,7 @@ def diffattack(
         decoder = None
         down_features = None
 
-        decode_latents = (1 / 0.18215 * latents.detach()).to(dtype=vae_dtype)
+        decode_latents = (latents.detach() / get_scaling_factor(model)).to(dtype=vae_dtype)
         decode_latents = torch.nan_to_num(
             decode_latents, nan=0.0, posinf=5.0, neginf=-5.0
         )

@@ -17,6 +17,11 @@ __pycache__/
 # Logs
 *.log
 
+# Generated experiment outputs
+exp/
+outputs/
+results/
+
 # Experiment artifacts: keep manifests/results tracked, but ignore copied image trees
 exp/**/real/
 exp/**/fake/

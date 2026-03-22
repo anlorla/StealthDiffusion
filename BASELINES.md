@@ -10,6 +10,7 @@ It is based on the ideas / parameterizations in:
 - `/root/gpufree-data/StealthDiffusion_BigGAN/A_FGSM.py`
 - `/root/gpufree-data/StealthDiffusion_BigGAN/A_PGD.py`
 - `/root/gpufree-data/StealthDiffusion_BigGAN/A_downsample_super.py` (future work; not wired yet)
+- `/root/gpufree-data/StealthDiffusion_BigGAN/blur_attack.py` (the reference file is empty; we use a simple Gaussian-blur baseline here)
 - `/root/gpufree-data/DiffAttack` (DiffAttack baseline; diffusion-latent attack from TPAMI 2024)
 
 ## Output format (compatible with our eval pipeline)
@@ -87,6 +88,18 @@ python scripts/run_baseline_attack.py \
   --batch 16
 ```
 
+## 4) Blur baseline (black-box transform baseline)
+
+```bash
+python scripts/run_baseline_attack.py \
+  --attack blur \
+  --images_root /root/gpufree-data/dataset/original_genimage_eval_1400/fake \
+  --save_dir /root/gpufree-data/dataset/Blur/attack_out/Blur_genimage_eval_1400_surS \
+  --model_name "S,E,R,D" \
+  --res 224 \
+  --blur_sigma 1.0
+```
+
 ## Evaluate baselines (post-attack)
 
 Build a dataroot:
@@ -94,22 +107,22 @@ Build a dataroot:
 ```bash
 python scripts/build_adv_dataroot.py \
   --clean_dataroot /root/gpufree-data/dataset/original_genimage_eval_1400 \
-  --attack_out /root/gpufree-data/dataset/StealthDiffusion/attack_out/baseline_pgd_surS_700 \
-  --out_dataroot /root/gpufree-data/dataset/StealthDiffusion/attack_datasets/baseline_pgd_original_genimage_eval_1400_surS \
-  --mode symlink
+  --attack_out /root/gpufree-data/dataset/PGD/attack_out/PGD_genimage_eval_1400_surS \
+  --out_dataroot /root/gpufree-data/dataset/PGD/attack_datasets/PGD_genimage_eval_1400_adv_surS \
+  --mode copy
 ```
 
 Evaluate and export per-image logits:
 
 ```bash
 python scripts/eval_detectors.py \
-  --dataroot /root/gpufree-data/dataset/StealthDiffusion/attack_datasets/baseline_pgd_original_genimage_eval_1400_surS \
+  --dataroot /root/gpufree-data/dataset/PGD/attack_datasets/PGD_genimage_eval_1400_adv_surS \
   --models E,R,D,S \
   --batch 32 \
   --out_csv exp/results/adv_logits_pgd_surS.csv
 ```
 
-## 4) DiffAttack baseline (diffusion-latent attack)
+## 5) DiffAttack baseline (diffusion-latent attack)
 
 We provide a wrapper that runs DiffAttack code on our dataset while using our detectors (E/R/D/S) as surrogate.
 

@@ -6,7 +6,12 @@ os.environ["http_proxy"] = "http://10.24.116.74:7890"
 os.environ["https_proxy"] = "http://10.24.116.74:7890"
 # os.environ["https_proxy"] = "https://127.0.0.1:7890"
 import torch
-from diffusers import StableDiffusionPipeline, DDIMScheduler
+from diffusers import (
+    DDIMInverseScheduler,
+    DDIMScheduler,
+    PixArtAlphaPipeline,
+    StableDiffusionPipeline,
+)
 import diff_latent_attack
 from PIL import Image
 import numpy as np
@@ -14,6 +19,7 @@ import os
 import glob
 import csv
 import shutil
+import json
 from datetime import datetime, timezone
 
 import random
@@ -118,6 +124,38 @@ def seed_torch(seed=42):
 seed_torch(42)
 
 
+def _infer_pipeline_class(pretrained_diffusion_path: str):
+    model_index_path = Path(pretrained_diffusion_path) / "model_index.json"
+    if model_index_path.exists():
+        with model_index_path.open("r", encoding="utf-8") as f:
+            model_index = json.load(f)
+        class_name = model_index.get("_class_name", "")
+        if class_name == "PixArtAlphaPipeline":
+            return PixArtAlphaPipeline
+        if class_name == "StableDiffusionPipeline":
+            return StableDiffusionPipeline
+
+    path_str = str(pretrained_diffusion_path).lower()
+    if "pixart" in path_str:
+        return PixArtAlphaPipeline
+    return StableDiffusionPipeline
+
+
+def load_diffusion_pipeline(pretrained_diffusion_path: str, device: str):
+    pipeline_cls = _infer_pipeline_class(pretrained_diffusion_path)
+    torch_dtype = torch.float16 if device.startswith("cuda") else torch.float32
+    from_pretrained_kwargs = {"torch_dtype": torch_dtype}
+    if Path(pretrained_diffusion_path).exists():
+        from_pretrained_kwargs["local_files_only"] = True
+
+    pipe = pipeline_cls.from_pretrained(pretrained_diffusion_path, **from_pretrained_kwargs).to(device)
+
+    scheduler_config = dict(pipe.scheduler.config)
+    pipe.scheduler = DDIMScheduler.from_config(scheduler_config)
+    pipe.inverse_scheduler = DDIMInverseScheduler.from_config(scheduler_config)
+    return pipe
+
+
 def run_diffusion_attack(
     image,
     label,
@@ -191,8 +229,7 @@ if __name__ == "__main__":
     # Change the path to "stabilityai/stable-diffusion-2-base" if you want to use the pretrained model.
     pretrained_diffusion_path = args.pretrained_diffusion_path
 
-    ldm_stable = StableDiffusionPipeline.from_pretrained(pretrained_diffusion_path).to('cuda')
-    ldm_stable.scheduler = DDIMScheduler.from_config(ldm_stable.scheduler.config)
+    ldm_stable = load_diffusion_pipeline(pretrained_diffusion_path, "cuda")
 
 
     dic_ = {"E":"efficientnet-b0",

@@ -15,8 +15,9 @@ This makes it compatible with:
 
 Baselines (inspired by StealthDiffusion_BigGAN/*):
   - downup: downsample then upsample (no gradients)
-  - fgsm:  FGSM on surrogate detector
-  - pgd:   PGD on surrogate detector
+  - fgsm:   FGSM on surrogate detector
+  - pgd:    PGD on surrogate detector
+  - blur:   gaussian blur (no gradients)
 """
 
 from __future__ import annotations
@@ -32,9 +33,10 @@ from typing import Dict, List, Tuple
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
 import torchattacks
 from natsort import natsorted, ns
-from PIL import Image
+from PIL import Image, ImageFilter
 from torchvision import transforms
 
 import sys
@@ -49,6 +51,18 @@ import other_attacks
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+class NormalizeByChannelMeanStd(nn.Module):
+    def __init__(self, mean: list[float], std: list[float]) -> None:
+        super().__init__()
+        mean_t = torch.tensor(mean).view(1, -1, 1, 1)
+        std_t = torch.tensor(std).view(1, -1, 1, 1)
+        self.register_buffer("mean", mean_t)
+        self.register_buffer("std", std_t)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
 
 
 def seed_all(seed: int) -> None:
@@ -124,6 +138,14 @@ def pil_downup(
     return up
 
 
+def pil_blur(img: Image.Image, sigma: float) -> Image.Image:
+    if sigma < 0:
+        raise ValueError(f"--blur_sigma must be >= 0, got {sigma}")
+    if sigma == 0:
+        return img.copy()
+    return img.filter(ImageFilter.GaussianBlur(radius=float(sigma)))
+
+
 def logits_to_score(logits: torch.Tensor) -> torch.Tensor:
     if logits.ndim != 2:
         raise ValueError(f"Unexpected logits shape: {tuple(logits.shape)}")
@@ -146,7 +168,7 @@ def predict_label(model: torch.nn.Module, x_norm: torch.Tensor) -> torch.Tensor:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--attack", choices=["downup", "fgsm", "pgd"], required=True)
+    ap.add_argument("--attack", choices=["downup", "fgsm", "pgd", "blur"], required=True)
     ap.add_argument("--images_root", required=True, help="Folder containing fake images (can have subset subfolders)")
     ap.add_argument("--save_dir", required=True, help="Output folder")
     ap.add_argument("--model_name", default="S,E,R,D", help="Comma-separated detector order; first is surrogate")
@@ -165,6 +187,7 @@ def main() -> int:
     ap.add_argument("--scale_h", type=float, default=0.75)
     ap.add_argument("--down_filter", type=str, default="LANCZOS")
     ap.add_argument("--up_filter", type=str, default="BICUBIC")
+    ap.add_argument("--blur_sigma", type=float, default=1.0)
 
     args = ap.parse_args()
     seed_all(args.seed)
@@ -209,19 +232,27 @@ def main() -> int:
     # Prepare attack object if needed
     attack = None
     if args.attack == "fgsm":
-        attack = torchattacks.FGSM(detectors[0], eps=float(args.eps))
-        attack.set_normalization_used(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        attack_model = nn.Sequential(
+            NormalizeByChannelMeanStd(IMAGENET_MEAN, IMAGENET_STD),
+            detectors[0],
+        ).to(device)
+        attack = torchattacks.FGSM(attack_model, eps=float(args.eps))
         logger.info(f"FGSM eps={args.eps}")
     elif args.attack == "pgd":
-        attack = torchattacks.PGD(
+        attack_model = nn.Sequential(
+            NormalizeByChannelMeanStd(IMAGENET_MEAN, IMAGENET_STD),
             detectors[0],
+        ).to(device)
+        attack = torchattacks.PGD(
+            attack_model,
             eps=float(args.eps),
             alpha=float(args.pgd_alpha),
             steps=int(args.pgd_steps),
             random_start=False,
         )
-        attack.set_normalization_used(mean=IMAGENET_MEAN, std=IMAGENET_STD)
         logger.info(f"PGD eps={args.eps} alpha={args.pgd_alpha} steps={args.pgd_steps}")
+    elif args.attack == "blur":
+        logger.info(f"Blur sigma={args.blur_sigma}")
     else:
         logger.info(
             f"DownUp scale_w={args.scale_w} scale_h={args.scale_h} "
@@ -239,7 +270,7 @@ def main() -> int:
         w = csv.writer(f)
         w.writerow(["idx", "src_path", "subset", "origin_path", "adv_path"])
 
-        # Batch loop for speed on fgsm/pgd; downup stays per-image.
+        # Batch loop for speed on fgsm/pgd; non-gradient baselines stay per-image.
         if args.attack in ("fgsm", "pgd"):
             for start in range(0, len(all_images), args.batch):
                 batch_paths = all_images[start : start + args.batch]
@@ -300,13 +331,18 @@ def main() -> int:
             for idx, p in enumerate(all_images):
                 im = Image.open(p).convert("RGB")
                 im_resized = im.resize((args.res, args.res), resample=Image.BICUBIC)
-                adv_im = pil_downup(
-                    im_resized,
-                    scale_w=float(args.scale_w),
-                    scale_h=float(args.scale_h),
-                    down_filter=args.down_filter,
-                    up_filter=args.up_filter,
-                )
+                if args.attack == "downup":
+                    adv_im = pil_downup(
+                        im_resized,
+                        scale_w=float(args.scale_w),
+                        scale_h=float(args.scale_h),
+                        down_filter=args.down_filter,
+                        up_filter=args.up_filter,
+                    )
+                elif args.attack == "blur":
+                    adv_im = pil_blur(im_resized, sigma=float(args.blur_sigma))
+                else:
+                    raise ValueError(f"Unsupported non-gradient attack: {args.attack}")
 
                 origin_path = save_dir / f"{idx:04d}_originImage.png"
                 adv_path = save_dir / f"{idx:04d}_adv_image.png"
@@ -355,4 +391,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
