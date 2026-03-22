@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 os.environ["all_proxy"] = "http://10.24.116.74:7890"
@@ -17,7 +18,10 @@ torch.backends.cudnn.enabled = True
 
 torch.backends.cudnn.benchmark = True
 # from model.vq_model import VQModel
-from lossers.lpips import LPIPS
+try:
+    from lossers.lpips import LPIPS
+except ModuleNotFoundError:
+    from lpips import LPIPS
 # from datasets import load_dataset
 from torch.utils.data import DataLoader
 import torchvision.datasets as datasets
@@ -26,7 +30,7 @@ from loggers import Logger
 from torch.utils.data.sampler import WeightedRandomSampler
 from ControlVAE import NewEncoder, NewDecoder
 import os
-from diffusers import StableDiffusionPipeline, DDIMScheduler
+from diffusers import StableDiffusionLatentUpscalePipeline, StableDiffusionPipeline
 
 
 def sample_data(loader):
@@ -82,6 +86,7 @@ from torch.utils.data import Dataset, DataLoader
 import glob
 import numpy as np
 from PIL import Image
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -91,6 +96,21 @@ IS_HIGH_VERSION = tuple(map(int, torch.__version__.split('+')[0].split('.'))) > 
 if IS_HIGH_VERSION:
     import torch.fft
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CHECKPOINT_ROOT = PROJECT_ROOT / "checkpoints"
+
+
+def build_dncnn_filter(device):
+    n_channels = 3
+    nb = 20
+    filter_path = CHECKPOINT_ROOT / "dncnn_color_blind.pth"
+    from models.network_dncnn import DnCNN as net
+
+    model = net(in_nc=n_channels, out_nc=n_channels, nc=64, nb=nb, act_mode='R').to(device)
+    model.load_state_dict(torch.load(filter_path, map_location=device), strict=True)
+    model = model.eval()
+    model.requires_grad_(False)
+    return model
 
 
 class FFL(nn.Module):
@@ -160,7 +180,7 @@ class FFL(nn.Module):
         if self.use_filter:
             n_channels = 3
             nb = 20
-            filter_path = "./checkpoints/dncnn_color_blind.pth"
+            filter_path = CHECKPOINT_ROOT / "dncnn_color_blind.pth"
             from models.network_dncnn import DnCNN as net
             filter = net(in_nc=n_channels, out_nc=n_channels, nc=64, nb=nb, act_mode='R').cuda()
             filter.load_state_dict(torch.load(filter_path), strict=True)
@@ -184,8 +204,9 @@ class FFL(nn.Module):
 
 
 class RealDataset(Dataset):
-    def __init__(self, paths, res=224):
-        self.paths = paths
+    def __init__(self, paths=None, files=None, res=224):
+        self.paths = paths or []
+        self.files = files or []
         self.data = self.get_data()
         self.res = res
 
@@ -207,9 +228,18 @@ class RealDataset(Dataset):
         return sample
 
     def get_data(self):
+        if self.files:
+            return list(self.files)
+
         data_list = []
         for path in self.paths:
-            data_list = data_list + glob.glob(path + "/*")
+            if os.path.isdir(path):
+                for candidate in glob.glob(os.path.join(path, "**", "*"), recursive=True):
+                    if os.path.isfile(candidate):
+                        data_list.append(candidate)
+            elif os.path.isfile(path):
+                data_list.append(path)
+        data_list = sorted(set(data_list))
         return data_list
 
 
@@ -271,48 +301,180 @@ if __name__ == '__main__':
         parser.add_argument("--noise_prototype", type=str,
                             default="/path/to/pretrain")
         parser.add_argument("--dir", type=str,
-                            default="/path/to/genimage")
+                            default="")
+        parser.add_argument("--real_root", type=str, default="",
+                            help="Root directory that contains training real images.")
+        parser.add_argument("--manifest", type=str, default="",
+                            help="Optional text/csv manifest listing one image path per line.")
+        parser.add_argument("--pipeline_type", type=str, default="sd", choices=["sd", "sr"],
+                            help="Load SD VAE or SR latent-upscaler VAE.")
+        parser.add_argument("--pretrained_diffusion_path", type=str, default="stabilityai/stable-diffusion-2-1-base",
+                            help="Diffusers pipeline path.")
+        parser.add_argument("--log_path", type=str, default="",
+                            help="Explicit log file path.")
+        parser.add_argument("--output_ckpt", type=str, default="",
+                            help="Explicit checkpoint path for the latest encoder weights.")
+        parser.add_argument("--seed", type=int, default=8888)
+        parser.add_argument("--lambda_recon_l1", type=float, default=1.0,
+                            help="L1 reconstruction weight.")
+        parser.add_argument("--lambda_recon_lpips", type=float, default=1.0,
+                            help="LPIPS reconstruction weight.")
+        parser.add_argument("--legacy_freq_weight", type=float, default=0.02,
+                            help="Legacy FFL(x_batch, rec) weight from the current training script.")
+        parser.add_argument("--enable_npl", type=int, default=0,
+                            help="If 1, enable prototype-based NPL frequency loss.")
+        parser.add_argument("--lambda_npl", type=float, default=10.0,
+                            help="Weight for prototype-based NPL loss when enable_npl=1.")
         # parser.add_argument('-d', '--dir', nargs='+', type=str, default=[
         #     "/path/to/nature",
         # ])
 
         args = parser.parse_args()
-        ldm_stable = StableDiffusionPipeline.from_pretrained("stabilityai/stable-diffusion-2-1-base").to('cuda')
-        if not os.path.exists("log"):
-            os.mkdir("log")
+        device = torch.device(args.device)
+        if args.pipeline_type == "sr":
+            ldm_stable = StableDiffusionLatentUpscalePipeline.from_pretrained(
+                args.pretrained_diffusion_path
+            ).to(device)
+        else:
+            ldm_stable = StableDiffusionPipeline.from_pretrained(
+                args.pretrained_diffusion_path
+            ).to(device)
 
-        logger = Logger(name='demofiles', log_path='log/train{}.log'.format(args.name))
-        lpips = LPIPS(net='vgg', cache_dir=args.cache_dir).cuda()
+        if args.log_path:
+            log_path = args.log_path
+            log_dir = os.path.dirname(log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+        else:
+            if not os.path.exists("log"):
+                os.mkdir("log")
+            log_path = 'log/train{}.log'.format(args.name)
 
+        logger = Logger(name='demofiles', log_path=log_path)
+        try:
+            lpips = LPIPS(net='vgg', cache_dir=args.cache_dir).cuda()
+        except TypeError:
+            lpips = LPIPS(net='vgg').cuda()
 
-        l = ['ADMnew/imagenet_ai_0508_adm/train/nature', 'BigGAN/imagenet_ai_0419_biggan/train/nature', 'glide/imagenet_glide/train/nature',
-         'Midjourney/imagenet_midjourney/train/nature', 'stable_diffusion_v_1_4/imagenet_ai_0419_sdv4/train/nature',
-         'stable_diffusion_v_1_5/imagenet_ai_0424_sdv5/train/nature', 'VQDM/imagenet_ai_0419_vqdm/train/nature',
-         'wukong/imagenet_ai_0424_wukong/train/nature']
-        #
-        paths_real = [args.dir + "/" + item for item in l]
-        # paths_real = args.dir
-        real_dataset = RealDataset(paths_real)
-        if not os.path.exists(args.noise_prototype):
-            real_dataset = RealDataset(paths_real)
-            noise_prototype = torch.zeros_like(real_dataset[0].unsqueeze(0))
-            n_channels = 3
-            nb = 20
-            filter_path = "./checkpoints/dncnn_color_blind.pth"
-            from models.network_dncnn import DnCNN as net
+        def load_manifest(manifest_path):
+            files = []
+            with open(manifest_path, "r") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    if "," in line:
+                        candidate = line.split(",")[-1].strip()
+                    else:
+                        candidate = line
+                    if candidate.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")):
+                        files.append(candidate)
+            return files
 
-            filter = net(in_nc=n_channels, out_nc=n_channels, nc=64, nb=nb, act_mode='R').cuda()
-            filter.load_state_dict(torch.load(filter_path), strict=True)
-            filter = filter.eval()
-            for i in tqdm(range(len(real_dataset))):
-                real = real_dataset[i].unsqueeze(0)
+        manifest_files = load_manifest(args.manifest) if args.manifest else []
+        if manifest_files:
+            real_dataset = RealDataset(files=manifest_files, res=args.size)
+        elif args.real_root:
+            real_dataset = RealDataset(paths=[args.real_root], res=args.size)
+        else:
+            l = ['ADMnew/imagenet_ai_0508_adm/train/nature', 'BigGAN/imagenet_ai_0419_biggan/train/nature', 'glide/imagenet_glide/train/nature',
+             'Midjourney/imagenet_midjourney/train/nature', 'stable_diffusion_v_1_4/imagenet_ai_0419_sdv4/train/nature',
+             'stable_diffusion_v_1_5/imagenet_ai_0424_sdv5/train/nature', 'VQDM/imagenet_ai_0419_vqdm/train/nature',
+             'wukong/imagenet_ai_0424_wukong/train/nature']
+            paths_real = [args.dir + "/" + item for item in l]
+            real_dataset = RealDataset(paths_real, res=args.size)
+
+        if len(real_dataset) == 0:
+            raise RuntimeError("No training real images found for ControlVAE training.")
+
+        noise_prototype_exists = bool(args.noise_prototype) and os.path.exists(args.noise_prototype)
+        npl_enabled = bool(int(args.enable_npl))
+        loss_terms = [
+            f"{args.lambda_recon_lpips} * lpips",
+            f"{args.lambda_recon_l1} * l1",
+        ]
+        if args.legacy_freq_weight != 0:
+            loss_terms.append(f"{args.legacy_freq_weight} * ffl(x_batch, rec)")
+        if npl_enabled:
+            loss_terms.append(f"{args.lambda_npl} * npl(rec, noise_prototype)")
+        logger.info(
+            json.dumps(
+                {
+                    "name": args.name,
+                    "pipeline_type": args.pipeline_type,
+                    "pretrained_diffusion_path": args.pretrained_diffusion_path,
+                    "real_root": args.real_root,
+                    "manifest": args.manifest,
+                    "dataset_size": len(real_dataset),
+                    "resume": args.resume,
+                    "init_mode": "resume_controlvae" if args.resume else "sr_vae_encoder_only",
+                    "save_dir": args.save_dir,
+                    "output_ckpt": args.output_ckpt,
+                    "size": args.size,
+                    "batch_size": args.batch_size,
+                    "iter": args.iter,
+                    "seed": args.seed,
+                    "noise_prototype_path": args.noise_prototype,
+                    "noise_prototype_exists_before_run": noise_prototype_exists,
+                    "npl_status": "active" if npl_enabled else "inactive",
+                    "actual_loss": " + ".join(loss_terms),
+                    "lambda_recon_l1": args.lambda_recon_l1,
+                    "lambda_recon_lpips": args.lambda_recon_lpips,
+                    "legacy_freq_weight": args.legacy_freq_weight,
+                    "enable_npl": int(npl_enabled),
+                    "lambda_npl": args.lambda_npl,
+                    "ffl_filter_defined": True,
+                    "ffl_filter_used": bool(npl_enabled),
+                },
+                ensure_ascii=True,
+            )
+        )
+        if not noise_prototype_exists:
+            noise_dataset = real_dataset
+            noise_prototype = torch.zeros_like(noise_dataset[0].unsqueeze(0))
+            filter = build_dncnn_filter(device)
+            for i in tqdm(range(len(noise_dataset))):
+                real = noise_dataset[i].unsqueeze(0)
                 with torch.no_grad():
                     real_noise = filter.noise(real)
                 noise_prototype += real_noise
-            noise_prototype /= len(real_dataset)
-            torch.save(noise_prototype, args.noise_prototype)
+            noise_prototype /= len(noise_dataset)
+            if args.noise_prototype:
+                os.makedirs(os.path.dirname(args.noise_prototype), exist_ok=True)
+                torch.save(noise_prototype, args.noise_prototype)
+            logger.info(
+                json.dumps(
+                    {
+                        "noise_prototype_generated": True,
+                        "noise_prototype_path": args.noise_prototype,
+                        "noise_prototype_num_images": len(noise_dataset),
+                    },
+                    ensure_ascii=True,
+                )
+            )
         else:
             noise_prototype = torch.load(args.noise_prototype)
+            logger.info(
+                json.dumps(
+                    {
+                        "noise_prototype_generated": False,
+                        "noise_prototype_loaded": True,
+                        "noise_prototype_path": args.noise_prototype,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+        noise_prototype = noise_prototype.to(device=device, dtype=torch.float32)
+        logger.info(
+            json.dumps(
+                {
+                    "noise_prototype_shape": list(noise_prototype.shape),
+                    "noise_prototype_dtype": str(noise_prototype.dtype),
+                    "noise_prototype_device": str(noise_prototype.device),
+                },
+                ensure_ascii=True,
+            )
+        )
 
 
 
@@ -394,13 +556,14 @@ if __name__ == '__main__':
 
         loss_l1 = torch.nn.L1Loss()
         loss_adv = torch.nn.CrossEntropyLoss()
-        optimizer = optim.AdamW(list(encoder.parameters())+list(decoder.parameters()), lr=0.001)
+        optimizer = optim.AdamW(encoder.parameters(), lr=0.001)
         ffl = FFL(loss_weight=1.0, alpha=1.0, log_matrix=False)
         ffl_filter = FFL(loss_weight=1.0, alpha=1.0, log_matrix=False, ave_spectrum=True, use_filter=True, use_single_filter=True)
+        residual_filter = build_dncnn_filter(device) if npl_enabled else None
 
         pbar = tqdm(range(args.iter))
 
-        generator = torch.Generator().manual_seed(8888)
+        generator = torch.Generator().manual_seed(args.seed)
 
         for idx in pbar:
             for idy, batch in enumerate(tqdm(real_dataloader)):
@@ -425,17 +588,32 @@ if __name__ == '__main__':
                 rec = decoder(decode_latents, down_features)
                 lpips_loss = lpips(x_batch, rec).mean()
                 l1_loss = loss_l1(x_batch, rec)
-
-
-
                 loss_ffl_filter = ffl(x_batch, rec)
-                loss_a = 0.
-                loss = lpips_loss + l1_loss + 0.02 * loss_ffl_filter
+                if npl_enabled:
+                    prototype_batch = noise_prototype.expand(rec.shape[0], -1, -1, -1)
+                    rec_noise = residual_filter.noise(rec)
+                    loss_npl = ffl.loss_formulation(
+                        ffl.tensor2freq(rec_noise).mean(0, keepdim=True),
+                        ffl.tensor2freq(prototype_batch).mean(0, keepdim=True),
+                    )
+                else:
+                    loss_npl = torch.zeros((), device=rec.device, dtype=rec.dtype)
+
+                loss = (
+                    args.lambda_recon_lpips * lpips_loss
+                    + args.lambda_recon_l1 * l1_loss
+                    + args.legacy_freq_weight * loss_ffl_filter
+                    + args.lambda_npl * loss_npl
+                )
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 if idy % args.freq_log == 0:
-                    logger.info("lpips_loss:{}  l1_loss:{} loss_ffl_filter:{}".format(lpips_loss, l1_loss, loss_ffl_filter))
+                    logger.info(
+                        "lpips_loss:{}  l1_loss:{} loss_ffl_filter:{} loss_npl:{} total_loss:{}".format(
+                            lpips_loss, l1_loss, loss_ffl_filter, loss_npl, loss
+                        )
+                    )
 
                     with torch.no_grad():
                         x_batch = x_batch.cuda()
@@ -479,7 +657,21 @@ if __name__ == '__main__':
                 if idy % args.freq_save == 0:
                     save_dir = args.save_dir
                     os.makedirs(save_dir, exist_ok=True)
-                    torch.save({
+                    latest_state = {
                         'encoder': encoder.state_dict(),
-                    }, "{}/{}_{}.pt".format(save_dir, idx, str(idy).zfill(6)),
+                    }
+                    torch.save(
+                        latest_state,
+                        "{}/{}_{}.pt".format(save_dir, idx, str(idy).zfill(6)),
                     )
+                    if args.output_ckpt:
+                        out_dir = os.path.dirname(args.output_ckpt)
+                        if out_dir:
+                            os.makedirs(out_dir, exist_ok=True)
+                        torch.save(latest_state, args.output_ckpt)
+
+        if args.output_ckpt:
+            out_dir = os.path.dirname(args.output_ckpt)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            torch.save({'encoder': encoder.state_dict()}, args.output_ckpt)
