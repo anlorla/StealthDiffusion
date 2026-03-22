@@ -2,11 +2,15 @@ import os
 from loggers import Logger
 
 os.environ['CUDA_VISIBLE_DEVICES'] = "0"
-os.environ["http_proxy"] = "http://10.24.116.74:7890"
-os.environ["https_proxy"] = "http://10.24.116.74:7890"
-# os.environ["https_proxy"] = "https://127.0.0.1:7890"
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 import torch
-from diffusers import StableDiffusionPipeline, DDIMScheduler
+from diffusers import (
+    StableDiffusionPipeline,
+    StableDiffusionLatentUpscalePipeline,
+    DDIMScheduler,
+    DDIMInverseScheduler,
+    EulerDiscreteScheduler,
+)
 import diff_latent_attack
 from PIL import Image
 import numpy as np
@@ -14,6 +18,7 @@ import os
 import glob
 import csv
 import shutil
+import json
 from datetime import datetime, timezone
 
 import random
@@ -22,6 +27,7 @@ from natsort import ns, natsorted
 import argparse
 import other_attacks
 from pathlib import Path
+from typing import List
 
 parser = argparse.ArgumentParser()
 
@@ -67,9 +73,9 @@ parser.add_argument('--images_root',
                     default="/root/gpufree-data/dataset/original_genimage_eval_1400/fake",
                     type=str, help='The clean images root directory')
 parser.add_argument('--pretrained_diffusion_path',
-                    default="stabilityai/stable-diffusion-2-1-base",
+                    default="/root/gpufree-data/checkpoints/hf_models/sd-x2-latent-upscaler",
                     type=str,
-                    help='Change the path to `stabilityai/stable-diffusion-2-base` if want to use the pretrained model')
+                    help='Diffusion backbone path. Supports StableDiffusionPipeline and StableDiffusionLatentUpscalePipeline.')
 parser.add_argument('--diffusion_steps', default=20, type=int, help='Total DDIM sampling steps')
 parser.add_argument('--start_step',
                     default=18,
@@ -77,6 +83,9 @@ parser.add_argument('--start_step',
 parser.add_argument('--iterations',
                     default=10,
                     type=int, help='Iterations of optimizing the adv_image')
+parser.add_argument('--lr',
+                    default=5e-4,
+                    type=float, help='Latent optimization learning rate')
 parser.add_argument('--res', default=224, type=int, help='Input image resized resolution')
 parser.add_argument('--model_name',
                     default="E,R,D,S",
@@ -86,7 +95,7 @@ parser.add_argument('--dataset_name',
                     type=str,
                     choices=["ours_try"],
                     help='The dataset name for generating adversarial examples')
-parser.add_argument('--is_encoder', default=1, type=int)
+parser.add_argument('--is_encoder', default=0, type=int)
 parser.add_argument('--encoder_weights',
                     default="/root/gpufree-data/checkpoints/Controlvae.pt",
                     type=str)
@@ -98,10 +107,31 @@ parser.add_argument('--pgd_steps', default=10, type=int, help='PGD steps for ini
 parser.add_argument('--pgd_alpha', default=None, type=float, help='PGD step size (default: eps/pgd_steps)')
 parser.add_argument('--lambda_l1', default=1.0, type=float, help='L1 loss coefficient (paper: alpha)')
 parser.add_argument('--lambda_lpips', default=1.0, type=float, help='LPIPS loss coefficient (paper: beta)')
+parser.add_argument('--lambda_perc', default=None, type=float, help='Alias of lambda_lpips for SR pilot runs')
 parser.add_argument('--lambda_latent', default=0.0, type=float, help='Latent L1 regularization coefficient (not in paper; default 0)')
 parser.add_argument('--attack_only_fake', default=1, type=int, help='If 1, only craft adversarial examples for fake images')
 parser.add_argument('--max_per_source', default=0, type=int, help='If >0, sample up to N fake images per generator/source (paper: 100)')
 parser.add_argument('--seed', default=42, type=int, help='Random seed used for sampling')
+parser.add_argument('--t_start', default=100.0, type=float, help='SR backbone add_noise starting timestep value')
+parser.add_argument(
+    '--freqsep_input',
+    action='store_true',
+    help='SR diagnostic mode: feed low-pass-upsampled image into the SR latent path and recompose only the generated high-frequency residual',
+)
+parser.add_argument(
+    '--freqsep_scale',
+    default=2,
+    type=int,
+    help='Downsample scale used by --freqsep_input (default: 2 for x2 latent upscaler)',
+)
+parser.add_argument(
+    '--freqsep_skip_recompose',
+    action='store_true',
+    help='SR diagnostic mode: use low-pass input for the SR latent path but do not recompose generated high-frequency residual back onto a base image',
+)
+parser.add_argument('--disable_pgd_warm_start', action='store_true', help='Skip PGD warm start and use the clean input image directly')
+parser.add_argument('--save_intermediates', action='store_true', help='Save clean / PGD / inversion / final images for diagnosis')
+parser.add_argument('--intermediate_root', default='', type=str, help='Root directory for intermediate images and per-image metadata')
 
 def seed_torch(seed=42):
     """For reproducibility"""
@@ -116,6 +146,41 @@ def seed_torch(seed=42):
 
 
 seed_torch(42)
+
+
+def _infer_pipeline_class(pretrained_diffusion_path: str):
+    model_index_path = Path(pretrained_diffusion_path) / "model_index.json"
+    if model_index_path.exists():
+        with open(model_index_path, "r") as f:
+            model_index = json.load(f)
+        class_name = model_index.get("_class_name", "")
+        if class_name == "StableDiffusionLatentUpscalePipeline":
+            return StableDiffusionLatentUpscalePipeline
+        if class_name == "StableDiffusionPipeline":
+            return StableDiffusionPipeline
+
+    if "sd-x2-latent-upscaler" in str(pretrained_diffusion_path):
+        return StableDiffusionLatentUpscalePipeline
+    return StableDiffusionPipeline
+
+
+def load_diffusion_pipeline(pretrained_diffusion_path: str, device: str):
+    pipeline_cls = _infer_pipeline_class(pretrained_diffusion_path)
+    torch_dtype = torch.float16 if device.startswith("cuda") else torch.float32
+    from_pretrained_kwargs = {"torch_dtype": torch_dtype}
+    if Path(pretrained_diffusion_path).exists():
+        from_pretrained_kwargs["local_files_only"] = True
+
+    pipe = pipeline_cls.from_pretrained(pretrained_diffusion_path, **from_pretrained_kwargs).to(device)
+    if pipeline_cls is StableDiffusionLatentUpscalePipeline:
+        diff_latent_attack.patch_euler_set_timesteps()
+        pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+        pipe.inverse_scheduler = None
+    else:
+        scheduler_config = dict(pipe.scheduler.config)
+        pipe.scheduler = DDIMScheduler.from_config(scheduler_config)
+        pipe.inverse_scheduler = DDIMInverseScheduler.from_config(scheduler_config)
+    return pipe
 
 
 def run_diffusion_attack(
@@ -133,15 +198,19 @@ def run_diffusion_attack(
     classes=None,
     logger=None,
     args=None,
+    intermediate_dir=None,
+    image_path=None,
 ):
     # Note: the actual file save is handled inside diff_latent_attack.diffattack().
-    image = image.resize((res, res), resample=Image.LANCZOS)
+    attack_image = image
+    if not diff_latent_attack.is_sr_backbone(diffusion_model):
+        attack_image = image.resize((res, res), resample=Image.LANCZOS)
     adv_image, adv_acc, adv_acc1, adv_acc2, adv_acc3, psnr, ssim = diff_latent_attack.diffattack(
         diffusion_model,
         label,
         num_inference_steps=diffusion_steps,
         guidance_scale=guidance,
-        image=image,
+        image=attack_image,
         compare=image,
         save_path=save_dir,
         out_path_adv=out_path_adv,
@@ -153,6 +222,8 @@ def run_diffusion_attack(
         logger=logger,
         args=args,
         idx=0,
+        intermediate_dir=intermediate_dir,
+        image_path=image_path,
     )
     adv_image = np.array(adv_image)
     return adv_image, adv_acc, adv_acc1, adv_acc2, adv_acc3, psnr, ssim
@@ -160,6 +231,8 @@ def run_diffusion_attack(
 
 if __name__ == "__main__":
     args = parser.parse_args()
+    if args.lambda_perc is not None:
+        args.lambda_lpips = args.lambda_perc
     guidance = args.guidance
     diffusion_steps = args.diffusion_steps  # Total DDIM sampling steps.
     start_step = args.start_step  # Which DDIM step to start the attack.
@@ -184,6 +257,11 @@ if __name__ == "__main__":
     logger = Logger(name="train", log_path=str(log_dir / f"attack_{name}_sur{surrogate}.log"))
 
     images_root = args.images_root  # The clean images' root directory.
+    if args.save_intermediates and args.intermediate_root:
+        intermediate_root = Path(args.intermediate_root)
+        intermediate_root.mkdir(parents=True, exist_ok=True)
+        with (intermediate_root / "run_args.json").open("w", encoding="utf-8") as f:
+            json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
 
     logger.info(f"\n******Attack based on Diffusion, Attacked Dataset: {args.dataset_name}*********")
@@ -191,8 +269,7 @@ if __name__ == "__main__":
     # Change the path to "stabilityai/stable-diffusion-2-base" if you want to use the pretrained model.
     pretrained_diffusion_path = args.pretrained_diffusion_path
 
-    ldm_stable = StableDiffusionPipeline.from_pretrained(pretrained_diffusion_path).to('cuda')
-    ldm_stable.scheduler = DDIMScheduler.from_config(ldm_stable.scheduler.config)
+    ldm_stable = load_diffusion_pipeline(pretrained_diffusion_path, 'cuda')
 
 
     dic_ = {"E":"efficientnet-b0",
@@ -297,6 +374,7 @@ if __name__ == "__main__":
     adv_all_acc1 = 0
     adv_all_acc2 = 0
     adv_all_acc3 = 0
+    per_image_records = []
 
     # s = 0
     psnrss = []
@@ -331,9 +409,9 @@ if __name__ == "__main__":
                 return tpl
         return tpl
 
-    def _iter_images(root_dir: Path) -> list[Path]:
+    def _iter_images(root_dir: Path) -> List[Path]:
         img_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-        files: list[Path] = []
+        files: List[Path] = []
         for p in root_dir.rglob("*"):
             if p.is_file() and p.suffix.lower() in img_exts:
                 files.append(p)
@@ -410,6 +488,10 @@ if __name__ == "__main__":
 
                 out_p = out_dataroot / "fake" / rel
                 out_p.parent.mkdir(parents=True, exist_ok=True)
+                intermediate_dir = None
+                if args.save_intermediates and args.intermediate_root:
+                    intermediate_dir = Path(args.intermediate_root) / rel
+                    intermediate_dir.parent.mkdir(parents=True, exist_ok=True)
 
                 if args.save_origin:
                     origin_p = out_dataroot / "_origin" / rel
@@ -431,6 +513,8 @@ if __name__ == "__main__":
                     args=args,
                     out_path_adv=str(out_p),
                     save_dir="",
+                    intermediate_dir=str(intermediate_dir) if intermediate_dir is not None else None,
+                    image_path=str(in_p),
                 )
 
                 adv_all_acc += adv_acc
@@ -439,6 +523,19 @@ if __name__ == "__main__":
                 adv_all_acc3 += adv_acc3
                 psnrss.append(psnrv)
                 ssimss.append(ssimv)
+                per_image_records.append(
+                    {
+                        "index": ind,
+                        "image_path": str(in_p),
+                        "adv_path": str(out_p),
+                        "acc_main": float(adv_acc),
+                        "acc_supp": float(adv_acc1),
+                        "acc_supp1": float(adv_acc2),
+                        "acc_supp2": float(adv_acc3),
+                        "psnr": float(psnrv),
+                        "ssim": float(ssimv),
+                    }
+                )
                 logger.info("final PSNR: {:.2f} dB; final SSIM: {:.4f}.".format(psnrv, ssimv))
 
                 clean_p = (fake_root_clean / rel) if fake_root_clean.exists() else in_p
@@ -487,6 +584,10 @@ if __name__ == "__main__":
                 tmp_image.save(os.path.join(save_dir, str(ind).rjust(4, "0") + "_originImage.png"))
 
             out_p = os.path.join(save_dir, str(ind).rjust(4, "0") + "_adv_image.png")
+            intermediate_dir = None
+            if args.save_intermediates and args.intermediate_root:
+                intermediate_dir = Path(args.intermediate_root) / str(ind).rjust(4, "0")
+                intermediate_dir.parent.mkdir(parents=True, exist_ok=True)
             adv_image, adv_acc, adv_acc1, adv_acc2, adv_acc3, psnrv, ssimv = run_diffusion_attack(
                 tmp_image,
                 label[ind : ind + 1],
@@ -502,6 +603,8 @@ if __name__ == "__main__":
                 save_dir="",
                 args=args,
                 out_path_adv=out_p,
+                intermediate_dir=str(intermediate_dir) if intermediate_dir is not None else None,
+                image_path=str(Path(image_path)),
             )
 
             adv_all_acc += adv_acc
@@ -510,7 +613,45 @@ if __name__ == "__main__":
             adv_all_acc3 += adv_acc3
             psnrss.append(psnrv)
             ssimss.append(ssimv)
+            per_image_records.append(
+                {
+                    "index": ind,
+                    "image_path": str(Path(image_path)),
+                    "adv_path": str(out_p),
+                    "acc_main": float(adv_acc),
+                    "acc_supp": float(adv_acc1),
+                    "acc_supp1": float(adv_acc2),
+                    "acc_supp2": float(adv_acc3),
+                    "psnr": float(psnrv),
+                    "ssim": float(ssimv),
+                }
+            )
             logger.info("final PSNR: {:.2f} dB; final SSIM: {:.4f}.".format(psnrv, ssimv))
+
+    summary = {
+        "output_mode": output_mode,
+        "num_images": len(all_images),
+        "adv_acc": adv_all_acc / len(all_images) if all_images else 0.0,
+        "adv_acc1": adv_all_acc1 / len(all_images) if all_images else 0.0,
+        "adv_acc2": adv_all_acc2 / len(all_images) if all_images else 0.0,
+        "adv_acc3": adv_all_acc3 / len(all_images) if all_images else 0.0,
+        "mean_psnr": float(np.mean(psnrss)) if psnrss else 0.0,
+        "mean_ssim": float(np.mean(ssimss)) if ssimss else 0.0,
+        "std_psnr": float(np.std(psnrss)) if psnrss else 0.0,
+        "std_ssim": float(np.std(ssimss)) if ssimss else 0.0,
+        "args": vars(args),
+    }
+
+    if args.intermediate_root:
+        intermediate_root = Path(args.intermediate_root)
+        intermediate_root.mkdir(parents=True, exist_ok=True)
+        with (intermediate_root / "summary_metrics.json").open("w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        with (intermediate_root / "per_image_metrics.json").open("w", encoding="utf-8") as f:
+            json.dump(per_image_records, f, indent=2, ensure_ascii=False)
+    if out_dataroot is not None:
+        with (out_dataroot / "summary_metrics.json").open("w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
 
     logger.info(f"output_mode={output_mode}")
     if out_dataroot is not None:
