@@ -194,3 +194,134 @@ As soon as a local PixArt-Alpha checkpoint is placed under the intended path, th
 ## Notes on repository state
 
 This clone inherited some pre-existing uncommitted changes from the source StealthDiffusion working tree. I did not revert them. My new work in this round is limited to the files listed above plus the generated diagnostics under `results/pixart_alpha_diagnostics/`.
+
+## DDIM diagnostic fixes locked in (2026-03-22)
+
+These are the settings that fixed the previously low PixArt DDIM reconstruction numbers during diagnostics.
+
+### 1. Deterministic VAE encode for diagnostics
+
+- code path:
+  `/root/gpufree-data/StealthDiffusion_PixArtAlpha/diff_latent_attack.py`
+- setting:
+  `sample_posterior=False`
+- meaning:
+  use the VAE posterior mode instead of sampling from the posterior
+- why it matters:
+  removes VAE sampling noise from diagnostics so the DDIM reconstruction score reflects scheduler / backbone behavior rather than stochastic encode noise
+
+### 2. PixArt local loading mode
+
+- code path:
+  `/root/gpufree-data/StealthDiffusion_PixArtAlpha/main.py`
+- settings:
+  - `variant="fp16"`
+  - `use_safetensors=True`
+- meaning:
+  force diffusers to load the local fp16 PixArt checkpoint files that were downloaded from Hugging Face
+- why it matters:
+  avoids loader mismatch against missing `.bin` weights and ensures the intended local checkpoint is used
+
+### 3. PixArt DDIM scheduler conversion fix
+
+- code path:
+  `/root/gpufree-data/StealthDiffusion_PixArtAlpha/main.py`
+- effective settings for PixArt when converting the original scheduler into DDIM:
+  - `prediction_type="epsilon"` (kept as-is from the checkpoint)
+  - `timestep_spacing="trailing"`
+  - `clip_sample=False`
+  - `set_alpha_to_one=False`
+  - `steps_offset=1`
+- meaning of each field:
+  - `prediction_type`:
+    tells the scheduler how to interpret the model output; here the PixArt checkpoint is treated as predicting noise `epsilon`
+  - `timestep_spacing`:
+    controls which discrete timesteps are selected from the 1000-step training grid; `trailing` keeps the inverse scheduler compatible and gives stable reconstruction
+  - `clip_sample`:
+    whether to clamp predicted `x0` during DDIM stepping; disabling clipping preserves latent values and avoids reconstruction damage
+  - `set_alpha_to_one`:
+    controls the alpha used at the boundary step; setting it to `False` matches latent-diffusion-style DDIM behavior better here
+  - `steps_offset`:
+    shifts the timestep grid by one; `1` aligns the DDIM grid better with the SD-style latent setup used in this repo
+- why it matters:
+  the previous DDIM conversion effectively fell back to unsuitable defaults (`clip_sample=True`, `set_alpha_to_one=True`, `steps_offset=0`), which was the main reason PixArt DDIM reconstruction was stuck around `19 dB`
+
+### 4. PixArt inverse scheduler pairing
+
+- code path:
+  `/root/gpufree-data/StealthDiffusion_PixArtAlpha/main.py`
+- setting:
+  `pipe.inverse_scheduler = DDIMInverseScheduler.from_config(scheduler_config)`
+- meaning:
+  inversion and denoising now use matched DDIM / DDIMInverse configurations derived from the same corrected config
+- why it matters:
+  keeps the reverse and forward processes aligned during the reconstruction diagnostic
+
+### 5. Diagnostic sweep protocol
+
+- code path:
+  `/root/gpufree-data/StealthDiffusion_PixArtAlpha/scripts/diagnose_pixart_alpha.py`
+- settings:
+  - single-image diagnostics use deterministic encode
+  - DDIM sweep steps: `20,50,100`
+- meaning:
+  evaluate whether reconstruction improves as the inversion / denoising grid becomes finer
+- why it matters:
+  confirms that the fixed scheduler configuration behaves sensibly across multiple step counts
+
+### Result after these fixes
+
+- PixArt DDIM reconstruction improved from about `18.84 / 19.04 / 19.10 dB` at `20 / 50 / 100` steps
+- to about `23.21 / 23.45 / 24.55 dB`
+- this indicates the main blocker in diagnostic 3 was scheduler-conversion configuration, not a fundamental PixArt backbone failure
+
+## Memory / gradient-checkpointing follow-up (2026-03-22)
+
+### Code changes
+
+- `diff_latent_attack.py`
+  - added `move_pipeline_modules_to_cpu()`
+  - added `offload_unused_conditioning_modules()`
+  - after building attack contexts, the code now offloads unused conditioning modules such as `text_encoder`
+- `main.py`
+  - added CLI flags:
+    - `--backbone_gradient_checkpointing`
+    - `--backbone_gc_vae`
+- `scripts/diagnose_pixart_alpha.py`
+  - memory probe now runs two cases:
+    - `frozen_no_gc`
+    - `denoiser_gc`
+  - the probe first precomputes prompt embeddings, then moves `text_encoder` and `vae` to CPU before measuring the denoiser-only backward pass
+
+### Why this change was needed
+
+- the earlier OOM was dominated by full-pipeline GPU residency, not by the single denoiser backward alone
+- PixArt keeps a large T5 text encoder on GPU by default; for the latent attack loop, text embeddings are fixed after context construction, so keeping the text encoder resident wastes memory
+
+### New probe result
+
+From:
+
+- `/root/gpufree-data/StealthDiffusion_PixArtAlpha/results/pixart_alpha_diagnostics/run_20260322_alpha_gcprobe/summary.json`
+
+The denoiser-only probe is now healthy without gradient checkpointing once unused modules are offloaded:
+
+- `frozen_no_gc`
+  - moved to CPU: `text_encoder`, `vae`
+  - allocated before probe: about `1181.93 MB`
+  - peak allocated during forward/backward: about `3005.08 MB`
+  - peak reserved: about `3304.00 MB`
+
+### Current limitation of PixArt GC in this env
+
+- the `denoiser_gc` probe still fails in the current `diffusers==0.24.0` style environment with:
+  - `Expected all tensors to be on the same device, but found at least two devices, cpu and cuda:0`
+- so the practical memory fix for now is:
+  - offload unused conditioning modules after prompt/context construction
+  - keep denoiser frozen
+  - treat backbone GC as optional / experimental rather than required
+
+### Practical conclusion
+
+- diagnostic 4 is no longer blocked by a blanket OOM
+- for the next alpha smoke run, the first memory optimization to rely on is text-encoder offload, not gradient checkpointing

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import socket
 import sys
@@ -18,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import diff_latent_attack  # noqa: E402
-from main import load_diffusion_pipeline  # noqa: E402
+from main import enable_backbone_gradient_checkpointing, load_diffusion_pipeline  # noqa: E402
 
 
 DEFAULT_SD_PATH = Path(
@@ -72,18 +73,12 @@ def load_image(path: Path, res: int) -> Image.Image:
 
 
 def maybe_enable_offload(pipe) -> str:
-    if hasattr(pipe, "enable_model_cpu_offload"):
-        pipe.enable_model_cpu_offload()
-        return "model_cpu_offload"
-    if hasattr(pipe, "enable_sequential_cpu_offload"):
-        pipe.enable_sequential_cpu_offload()
-        return "sequential_cpu_offload"
     return "none"
 
 
 @torch.no_grad()
 def run_vae_recon(pipe, image: Image.Image, res: int, out_path: Path) -> dict[str, float]:
-    latents = diff_latent_attack.encoder(image, pipe, res=res)
+    latents = diff_latent_attack.encoder(image, pipe, res=res, sample_posterior=False)
     decode_latents = (latents / diff_latent_attack.get_scaling_factor(pipe)).to(dtype=next(pipe.vae.parameters()).dtype)
     recon = pipe.vae.decode(decode_latents)["sample"]
     save_tensor_image(recon, out_path)
@@ -105,6 +100,7 @@ def run_ddim_recon(pipe, image: Image.Image, res: int, out_path: Path, num_infer
         num_inference_steps=num_inference_steps,
         guidance_scale=0.0,
         res=res,
+        sample_posterior=False,
     )
     latent = inversion_latents[-1]
     context = diff_latent_attack.build_context(pipe, [""], res=res)
@@ -122,17 +118,78 @@ def run_ddim_recon(pipe, image: Image.Image, res: int, out_path: Path, num_infer
     }
 
 
+def parse_step_sweep(raw: str) -> list[int]:
+    vals = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        vals.append(int(item))
+    return vals
+
+
+def run_ddim_recon_sweep(pipe, image: Image.Image, res: int, out_dir: Path, prefix: str, step_list: list[int]) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for steps in step_list:
+        out_path = out_dir / f"{prefix}_ddim_recon_steps{steps}.png"
+        try:
+            result = run_ddim_recon(pipe, image, res, out_path, steps)
+            result["num_inference_steps"] = steps
+            out[str(steps)] = result
+        except Exception as exc:
+            out[str(steps)] = {"status": "failed", "error": repr(exc), "num_inference_steps": steps}
+    return out
+
+
 def run_memory_probe(pipe, res: int) -> dict[str, float]:
+    device = next(diff_latent_attack.get_denoiser(pipe).parameters()).device
+    results: dict[str, object] = {
+        "status": "ok",
+        "device": str(device),
+        "cases": {},
+    }
+
+    for case_name, enable_gc in (("frozen_no_gc", False), ("denoiser_gc", True)):
+        try:
+            results["cases"][case_name] = run_memory_probe_case(pipe, res, enable_gc=enable_gc)
+        except Exception as exc:
+            results["cases"][case_name] = {"status": "failed", "error": repr(exc)}
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+    return results
+
+
+def run_memory_probe_case(pipe, res: int, enable_gc: bool) -> dict[str, float]:
     denoiser = diff_latent_attack.get_denoiser(pipe)
     device = next(denoiser.parameters()).device
     dtype = next(denoiser.parameters()).dtype
     pipe.scheduler.set_timesteps(1, device=device)
 
-    prompt_info = diff_latent_attack.encode_prompt_embeddings(pipe, [""])
-    if diff_latent_attack.is_pixart_alpha_backbone(pipe):
-        context = diff_latent_attack.build_context(pipe, [""], res=res)
-    else:
-        context = {"encoder_hidden_states": torch.cat([prompt_info["uncond_embeddings"], prompt_info["text_embeddings"]], dim=0)}
+    with torch.no_grad():
+        prompt_info = diff_latent_attack.encode_prompt_embeddings(pipe, [""])
+        if diff_latent_attack.is_pixart_alpha_backbone(pipe):
+            context = diff_latent_attack.build_context(pipe, [""], res=res)
+        else:
+            context = {
+                "encoder_hidden_states": torch.cat(
+                    [prompt_info["uncond_embeddings"], prompt_info["text_embeddings"]],
+                    dim=0,
+                )
+            }
+
+    moved_to_cpu = diff_latent_attack.offload_unused_conditioning_modules(pipe)
+    moved_to_cpu.extend(diff_latent_attack.move_pipeline_modules_to_cpu(pipe, ["vae"]))
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    denoiser.requires_grad_(False)
+    denoiser.zero_grad(set_to_none=True)
+    denoiser.eval()
+    enabled_modules = []
+    if enable_gc:
+        enabled_modules = enable_backbone_gradient_checkpointing(pipe, enable_vae=False)
 
     latent_h = res // pipe.vae_scale_factor
     latent_w = res // pipe.vae_scale_factor
@@ -140,11 +197,30 @@ def run_memory_probe(pipe, res: int) -> dict[str, float]:
     t = pipe.scheduler.timesteps[0]
 
     torch.cuda.reset_peak_memory_stats(device)
+    before_allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
+    peak_reserved_mb = None
     pred = diff_latent_attack.get_model_prediction(pipe, latents, context, t, guidance_scale=0.0)
     loss = pred.float().square().mean()
     loss.backward()
     peak_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-    return {"peak_allocated_mb": float(peak_mb), "loss": float(loss.detach().cpu())}
+    peak_reserved_mb = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+
+    result = {
+        "status": "ok",
+        "enable_gc": enable_gc,
+        "enabled_modules": enabled_modules,
+        "moved_to_cpu": moved_to_cpu,
+        "allocated_before_mb": float(before_allocated_mb),
+        "peak_allocated_mb": float(peak_mb),
+        "peak_reserved_mb": float(peak_reserved_mb),
+        "loss": float(loss.detach().cpu()),
+    }
+
+    del latents, pred, loss, context, prompt_info
+    denoiser.zero_grad(set_to_none=True)
+    gc.collect()
+    torch.cuda.empty_cache()
+    return result
 
 
 def main() -> int:
@@ -156,6 +232,7 @@ def main() -> int:
     ap.add_argument("--prompt", default="a photo of a cat")
     ap.add_argument("--res", type=int, default=512)
     ap.add_argument("--num_inference_steps", type=int, default=20)
+    ap.add_argument("--ddim_step_sweep", default="20,50,100")
     args = ap.parse_args()
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -201,6 +278,7 @@ def main() -> int:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     summary: dict[str, object] = {"env": env_summary}
+    step_sweep = parse_step_sweep(args.ddim_step_sweep)
     image = load_image(args.image_path, args.res)
     image.save(out_dir / "input_resized.png")
 
@@ -217,6 +295,7 @@ def main() -> int:
         )
     except Exception as exc:
         summary["sd_ddim_recon"] = {"status": "failed", "error": repr(exc)}
+    summary["sd_ddim_recon_sweep"] = run_ddim_recon_sweep(sd, image, args.res, out_dir, "sd21", step_sweep)
 
     if not args.pixart_path.exists():
         summary["pixart_status"] = {
@@ -278,6 +357,7 @@ def main() -> int:
         )
     except Exception as exc:
         summary["pixart_ddim_recon"] = {"status": "failed", "error": repr(exc)}
+    summary["pixart_ddim_recon_sweep"] = run_ddim_recon_sweep(pixart, image, args.res, out_dir, "pixart", step_sweep)
 
     try:
         if torch.cuda.is_available():

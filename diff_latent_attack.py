@@ -124,10 +124,63 @@ def get_scaling_factor(model):
     return float(getattr(model.vae.config, "scaling_factor", 0.18215) or 0.18215)
 
 
+def move_pipeline_modules_to_cpu(model, module_names):
+    moved = []
+    for name in module_names:
+        module = getattr(model, name, None)
+        if isinstance(module, torch.nn.Module):
+            module.to("cpu")
+            moved.append(name)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return moved
+
+
+def move_pipeline_modules_to_device(model, module_names, device):
+    moved = []
+    for name in module_names:
+        module = getattr(model, name, None)
+        if isinstance(module, torch.nn.Module):
+            module.to(device)
+            moved.append(name)
+    return moved
+
+
+def get_pipeline_execution_device(model):
+    device = getattr(model, "_execution_device", None)
+    if device is None:
+        device = getattr(model, "device", None)
+    if device is None or str(device) == "meta":
+        device = next(get_denoiser(model).parameters()).device
+    return torch.device(device)
+
+
+def ensure_core_pipeline_modules_on_device(model):
+    device = get_pipeline_execution_device(model)
+    module_names = ["vae"]
+    module_names.append("transformer" if is_pixart_alpha_backbone(model) else "unet")
+    move_pipeline_modules_to_device(model, module_names, device)
+    return device
+
+
+def offload_unused_conditioning_modules(model):
+    return move_pipeline_modules_to_cpu(
+        model,
+        [
+            "text_encoder",
+            "text_encoder_2",
+            "image_encoder",
+            "safety_checker",
+        ],
+    )
+
+
 def encode_prompt_embeddings(model, prompt):
     prompt = prompt if isinstance(prompt, list) else [prompt]
+    exec_device = ensure_core_pipeline_modules_on_device(model)
 
     if is_pixart_alpha_backbone(model):
+        move_pipeline_modules_to_device(model, ["text_encoder"], exec_device)
         (
             prompt_embeds,
             prompt_attention_mask,
@@ -138,7 +191,7 @@ def encode_prompt_embeddings(model, prompt):
             do_classifier_free_guidance=True,
             negative_prompt="",
             num_images_per_prompt=1,
-            device=model.device,
+            device=exec_device,
             clean_caption=False,
         )
         return {
@@ -153,7 +206,7 @@ def encode_prompt_embeddings(model, prompt):
     uncond_input = model.tokenizer(
         [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt"
     )
-    uncond_embeddings = model.text_encoder(uncond_input.input_ids.to(model.device))[0]
+    uncond_embeddings = model.text_encoder(uncond_input.input_ids.to(exec_device))[0]
 
     text_input = model.tokenizer(
         prompt,
@@ -162,7 +215,7 @@ def encode_prompt_embeddings(model, prompt):
         truncation=True,
         return_tensors="pt",
     )
-    text_embeddings = model.text_encoder(text_input.input_ids.to(model.device))[0]
+    text_embeddings = model.text_encoder(text_input.input_ids.to(exec_device))[0]
     return {
         "text_embeddings": text_embeddings,
         "uncond_embeddings": uncond_embeddings,
@@ -254,25 +307,24 @@ def get_model_prediction(model, latents, context, t, guidance_scale):
     return noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
 
 
-def encoder(image, model, res=512):
+def encoder(image, model, res=512, sample_posterior=True):
     """
     用 VAE 的 device/dtype 做预处理，再把 latent 转成 denoiser 的 dtype
     """
+    ensure_core_pipeline_modules_on_device(model)
     vae_param = next(model.vae.parameters())
     denoiser_param = next(get_denoiser(model).parameters())
     vae_device = vae_param.device
     vae_dtype = vae_param.dtype
     denoiser_dtype = denoiser_param.dtype
 
-    generator = torch.Generator(device=vae_device).manual_seed(8888)
     image = preprocess(image, res, device=vae_device, dtype=vae_dtype)
-
-    gpu_generator = torch.Generator(device=vae_device)
-    gpu_generator.manual_seed(generator.initial_seed())
-
-    latents = get_scaling_factor(model) * model.vae.encode(image).latent_dist.sample(
-        generator=gpu_generator
-    )
+    posterior = model.vae.encode(image).latent_dist
+    if sample_posterior:
+        generator = torch.Generator(device=vae_device).manual_seed(8888)
+        latents = get_scaling_factor(model) * posterior.sample(generator=generator)
+    else:
+        latents = get_scaling_factor(model) * posterior.mode()
 
     latents = latents.to(dtype=denoiser_dtype)
     return latents
@@ -299,17 +351,20 @@ def ddim_reverse_sample(
     num_inference_steps: int = 20,
     guidance_scale: float = 2.5,
     res=512,
+    sample_posterior=True,
 ):
     """
     ==========================================
     ============ DDIM Inversion ==============
     ==========================================
     """
+    ensure_core_pipeline_modules_on_device(model)
     if is_pixart_alpha_backbone(model) and getattr(model, "inverse_scheduler", None) is not None:
-        model.scheduler.set_timesteps(num_inference_steps, device=model.device)
-        model.inverse_scheduler.set_timesteps(num_inference_steps, device=model.device)
+        exec_device = get_pipeline_execution_device(model)
+        model.scheduler.set_timesteps(num_inference_steps, device=exec_device)
+        model.inverse_scheduler.set_timesteps(num_inference_steps, device=exec_device)
 
-        latents = encoder(image, model, res=res)
+        latents = encoder(image, model, res=res, sample_posterior=sample_posterior)
         timesteps = model.inverse_scheduler.timesteps
         context = build_context(model, [prompt[0]], res=res)
 
@@ -323,7 +378,7 @@ def ddim_reverse_sample(
     context = build_context(model, [prompt[0]], res=res)
     model.scheduler.set_timesteps(num_inference_steps)
 
-    latents = encoder(image, model, res=res)
+    latents = encoder(image, model, res=res, sample_posterior=sample_posterior)
     timesteps = model.scheduler.timesteps.flip(0)
 
     all_latents = [latents]
@@ -412,6 +467,7 @@ def diffattack(
         raise NotImplementedError
 
     # VAE / denoiser 精度 & device
+    ensure_core_pipeline_modules_on_device(model)
     denoiser_param = next(get_denoiser(model).parameters())
     vae_param = next(model.vae.parameters())
     device = denoiser_param.device
@@ -564,7 +620,8 @@ def diffattack(
     init_prompt = [""]
 
     batch_size_init = len(init_prompt)
-    init_prompt_info = encode_prompt_embeddings(model, init_prompt)
+    with torch.no_grad():
+        init_prompt_info = encode_prompt_embeddings(model, init_prompt)
     uncond_embeddings = init_prompt_info["uncond_embeddings"]
     uncond_attention_mask = init_prompt_info.get("uncond_attention_mask")
 
@@ -577,8 +634,6 @@ def diffattack(
                 f"[INV] step {k}: mean={z.mean().item():.4f}, std={z.std().item():.4f}, "
                 f"nan={torch.isnan(z).any().item()}, inf={torch.isinf(z).any().item()}"
             )
-
-    uncond_embeddings.requires_grad_(True)
 
     for _ind, _t in enumerate(
         tqdm(model.scheduler.timesteps[1 + start_step - 1 :], desc="Optimize_uncond_embed")
@@ -598,15 +653,26 @@ def diffattack(
         uncond_mask = None
         if all_uncond_masks:
             uncond_mask = all_uncond_masks[i].repeat(batch_size, 1)
-        context.append(
-            build_context(
+        with torch.no_grad():
+            context_i = build_context(
                 model,
                 prompt,
                 res=height,
                 uncond_embeddings=all_uncond_emb[i].repeat(batch_size, 1, 1),
                 uncond_attention_mask=uncond_mask,
             )
-        )
+        for key, value in context_i.items():
+            if torch.is_tensor(value):
+                context_i[key] = value.detach()
+            elif isinstance(value, dict):
+                context_i[key] = {
+                    subkey: subvalue.detach() if torch.is_tensor(subvalue) else subvalue
+                    for subkey, subvalue in value.items()
+                }
+        context.append(context_i)
+
+    offload_unused_conditioning_modules(model)
+    ensure_core_pipeline_modules_on_device(model)
 
     get_denoiser(model).requires_grad_(False)
     model.vae.requires_grad_(False)
@@ -620,7 +686,7 @@ def diffattack(
     latent_opt = torch.nn.Parameter(latent.detach().clone().to(device=device, dtype=torch.float32))
     latent_opt.requires_grad_(True)
 
-    optimizer = optim.AdamW([latent_opt], lr=5e-4)
+    optimizer = optim.AdamW([latent_opt], lr=float(getattr(args, "lr", 1e-3)))
     cross_entro = torch.nn.CrossEntropyLoss()
     loss_l1 = torch.nn.L1Loss()
     lpips = LPIPS(net="vgg").cuda()
@@ -884,7 +950,7 @@ def diffattack(
         std=[1 / s for s in std],
     )
 
-    out_image_norm = normalize3(out_image)
+    out_image_norm = normalize3(out_image.float())
 
     pred = classifier(out_image_norm)
     pred_label = torch.argmax(pred, 1).detach()

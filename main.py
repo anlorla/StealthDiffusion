@@ -83,6 +83,7 @@ parser.add_argument('--start_step',
 parser.add_argument('--iterations',
                     default=10,
                     type=int, help='Iterations of optimizing the adv_image')
+parser.add_argument('--lr', default=1e-3, type=float, help='Latent optimizer learning rate')
 parser.add_argument('--res', default=224, type=int, help='Input image resized resolution')
 parser.add_argument('--model_name',
                     default="E,R,D,S",
@@ -108,6 +109,10 @@ parser.add_argument('--lambda_latent', default=0.0, type=float, help='Latent L1 
 parser.add_argument('--attack_only_fake', default=1, type=int, help='If 1, only craft adversarial examples for fake images')
 parser.add_argument('--max_per_source', default=0, type=int, help='If >0, sample up to N fake images per generator/source (paper: 100)')
 parser.add_argument('--seed', default=42, type=int, help='Random seed used for sampling')
+parser.add_argument('--backbone_gradient_checkpointing', default=0, type=int, help='If 1, enable gradient checkpointing on the denoiser backbone')
+parser.add_argument('--backbone_gc_vae', default=0, type=int, help='If 1 together with --backbone_gradient_checkpointing, also enable VAE gradient checkpointing')
+parser.add_argument('--save_intermediates', action='store_true', help='Save run args and metrics for smoke / diagnostics')
+parser.add_argument('--intermediate_root', default='', type=str, help='Root directory for run-side metadata and optional intermediates')
 
 def seed_torch(seed=42):
     """For reproducibility"""
@@ -147,13 +152,43 @@ def load_diffusion_pipeline(pretrained_diffusion_path: str, device: str):
     from_pretrained_kwargs = {"torch_dtype": torch_dtype}
     if Path(pretrained_diffusion_path).exists():
         from_pretrained_kwargs["local_files_only"] = True
+    if pipeline_cls is PixArtAlphaPipeline:
+        from_pretrained_kwargs["variant"] = "fp16"
+        from_pretrained_kwargs["use_safetensors"] = True
 
     pipe = pipeline_cls.from_pretrained(pretrained_diffusion_path, **from_pretrained_kwargs).to(device)
 
     scheduler_config = dict(pipe.scheduler.config)
+    if pipeline_cls is PixArtAlphaPipeline:
+        if scheduler_config.get("timestep_spacing") == "linspace":
+            scheduler_config["timestep_spacing"] = "trailing"
+        scheduler_config["clip_sample"] = False
+        scheduler_config["set_alpha_to_one"] = False
+        scheduler_config["steps_offset"] = 1
+    elif scheduler_config.get("timestep_spacing") == "linspace":
+        scheduler_config["timestep_spacing"] = "leading"
     pipe.scheduler = DDIMScheduler.from_config(scheduler_config)
     pipe.inverse_scheduler = DDIMInverseScheduler.from_config(scheduler_config)
     return pipe
+
+
+def enable_backbone_gradient_checkpointing(pipe, enable_vae: bool = False):
+    denoiser = diff_latent_attack.get_denoiser(pipe)
+    enabled = []
+
+    denoiser.requires_grad_(False)
+    if hasattr(denoiser, "enable_gradient_checkpointing"):
+        denoiser.enable_gradient_checkpointing()
+        denoiser.train()
+        enabled.append("denoiser")
+
+    pipe.vae.requires_grad_(False)
+    if enable_vae and hasattr(pipe.vae, "enable_gradient_checkpointing"):
+        pipe.vae.enable_gradient_checkpointing()
+        pipe.vae.train()
+        enabled.append("vae")
+
+    return enabled
 
 
 def run_diffusion_attack(
@@ -222,6 +257,11 @@ if __name__ == "__main__":
     logger = Logger(name="train", log_path=str(log_dir / f"attack_{name}_sur{surrogate}.log"))
 
     images_root = args.images_root  # The clean images' root directory.
+    if args.save_intermediates and args.intermediate_root:
+        intermediate_root = Path(args.intermediate_root)
+        intermediate_root.mkdir(parents=True, exist_ok=True)
+        with (intermediate_root / "run_args.json").open("w", encoding="utf-8") as f:
+            json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
 
     logger.info(f"\n******Attack based on Diffusion, Attacked Dataset: {args.dataset_name}*********")
@@ -230,6 +270,12 @@ if __name__ == "__main__":
     pretrained_diffusion_path = args.pretrained_diffusion_path
 
     ldm_stable = load_diffusion_pipeline(pretrained_diffusion_path, "cuda")
+    if args.backbone_gradient_checkpointing:
+        enabled_gc = enable_backbone_gradient_checkpointing(
+            ldm_stable,
+            enable_vae=bool(args.backbone_gc_vae),
+        )
+        logger.info(f"Enabled backbone gradient checkpointing on: {enabled_gc}")
 
 
     dic_ = {"E":"efficientnet-b0",
@@ -368,9 +414,9 @@ if __name__ == "__main__":
                 return tpl
         return tpl
 
-    def _iter_images(root_dir: Path) -> list[Path]:
+    def _iter_images(root_dir: Path):
         img_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-        files: list[Path] = []
+        files = []
         for p in root_dir.rglob("*"):
             if p.is_file() and p.suffix.lower() in img_exts:
                 files.append(p)
@@ -393,6 +439,7 @@ if __name__ == "__main__":
     manifest_fake = None
     manifest_fake_adv = None
     out_dataroot = None
+    per_image_records = []
 
     if output_mode == "final":
         out_dataroot = Path(_format_path_template(args.out_dataroot))
@@ -491,6 +538,20 @@ if __name__ == "__main__":
 
                 w_fake.writerow([out_s, out_s])
                 w_adv.writerow([ind, clean_s, out_s, out_s])
+                per_image_records.append(
+                    {
+                        "idx": ind,
+                        "input_path": str(in_p),
+                        "clean_path": str(clean_p),
+                        "adv_path": str(out_p),
+                        "acc_main": float(adv_acc),
+                        "acc_supp": float(adv_acc1),
+                        "acc_supp1": float(adv_acc2),
+                        "acc_supp2": float(adv_acc3),
+                        "psnr": float(psnrv),
+                        "ssim": float(ssimv),
+                    }
+                )
 
         meta = out_dataroot / "meta.txt"
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -548,6 +609,44 @@ if __name__ == "__main__":
             psnrss.append(psnrv)
             ssimss.append(ssimv)
             logger.info("final PSNR: {:.2f} dB; final SSIM: {:.4f}.".format(psnrv, ssimv))
+            per_image_records.append(
+                {
+                    "idx": ind,
+                    "input_path": str(image_path),
+                    "clean_path": str(image_path),
+                    "adv_path": str(out_p),
+                    "acc_main": float(adv_acc),
+                    "acc_supp": float(adv_acc1),
+                    "acc_supp1": float(adv_acc2),
+                    "acc_supp2": float(adv_acc3),
+                    "psnr": float(psnrv),
+                    "ssim": float(ssimv),
+                }
+            )
+
+    summary = {
+        "output_mode": output_mode,
+        "num_images": len(all_images),
+        "adv_acc": adv_all_acc / len(all_images) if all_images else 0.0,
+        "adv_acc1": adv_all_acc1 / len(all_images) if all_images else 0.0,
+        "adv_acc2": adv_all_acc2 / len(all_images) if all_images else 0.0,
+        "adv_acc3": adv_all_acc3 / len(all_images) if all_images else 0.0,
+        "mean_psnr": float(np.mean(psnrss)) if psnrss else 0.0,
+        "mean_ssim": float(np.mean(ssimss)) if ssimss else 0.0,
+        "std_psnr": float(np.std(psnrss)) if psnrss else 0.0,
+        "std_ssim": float(np.std(ssimss)) if ssimss else 0.0,
+        "args": vars(args),
+    }
+    if args.intermediate_root:
+        intermediate_root = Path(args.intermediate_root)
+        intermediate_root.mkdir(parents=True, exist_ok=True)
+        with (intermediate_root / "summary_metrics.json").open("w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        with (intermediate_root / "per_image_metrics.json").open("w", encoding="utf-8") as f:
+            json.dump(per_image_records, f, indent=2, ensure_ascii=False)
+    if out_dataroot is not None:
+        with (out_dataroot / "summary_metrics.json").open("w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
 
     logger.info(f"output_mode={output_mode}")
     if out_dataroot is not None:
