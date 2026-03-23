@@ -59,3 +59,34 @@
 
 ## Summary CSV
 - `/root/gpufree-data/StealthDiffusion_PixArtAlpha/results/full_700_20260323/suite_summary.csv`
+
+# PixArt-Alpha + ControlVAE full-700 surS launch (2026-03-23)
+
+## Problem
+- Evaluate whether enabling ControlVAE on PixArt-Alpha improves the full GenImage-700 surrogate-S attack compared with the matched PixArt no-ControlVAE and SD/SR baselines.
+
+## Pipeline
+- load PixArt-Alpha backbone
+- encode clean fake image into latent
+- run DDIM inversion
+- apply PGD warm start + latent optimization
+- run DDIM denoising
+- decode adversarial latent with ControlVAE
+- export full evaluation dataroot with clean real + adversarial fake
+- evaluate detectors, visual quality, and frequency statistics
+
+## Candidate Modules
+- enabled: PixArtAlphaPipeline.transformer, vae, tokenizer, text_encoder, ControlVAE NewEncoder, ControlVAE NewDecoder, detectors E/R/D/S
+
+## IO
+- input clean dataroot: `/root/gpufree-data/dataset/original_genimage_eval_1400`
+- input fake source: `/root/gpufree-data/dataset/original_genimage_eval_1400/fake`
+- output dataset: `/root/gpufree-data/dataset/pixart_alpha/attack_datasets/full_700/PixArtAlpha_genimage_eval_1400_adv_ctrlvae_surS`
+- output evaluation: `/root/gpufree-data/DiffSRAttack/results/PixArtAlpha_ctrlvae`
+- output logs: `/root/gpufree-data/StealthDiffusion_PixArtAlpha/results/full_700_ctrlvae_20260323`
+- output weights: `/root/gpufree-data/checkpoints/Controlvae.pt`
+
+## Runtime
+- tmux session: `pixart_ctrlvae_700_surS`
+- post-run record updater: `pixart_ctrlvae_700_surS_post`
+- suite spec: `/root/gpufree-data/StealthDiffusion_PixArtAlpha/results/full_700_ctrlvae_20260323/suite_spec.md`
