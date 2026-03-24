@@ -156,7 +156,7 @@ def get_pipeline_execution_device(model):
 
 
 def ensure_core_pipeline_modules_on_device(model):
-    device = get_pipeline_execution_device(model)
+    device = torch.device("cuda") if torch.cuda.is_available() else get_pipeline_execution_device(model)
     module_names = ["vae"]
     module_names.append("transformer" if is_pixart_alpha_backbone(model) else "unet")
     move_pipeline_modules_to_device(model, module_names, device)
@@ -274,6 +274,7 @@ def build_context(
 
 
 def get_model_prediction(model, latents, context, t, guidance_scale):
+    ensure_core_pipeline_modules_on_device(model)
     latent_model_input = torch.cat([latents] * 2)
 
     if is_pixart_alpha_backbone(model):
