@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from loggers import Logger
 
@@ -132,6 +134,10 @@ parser.add_argument(
 parser.add_argument('--disable_pgd_warm_start', action='store_true', help='Skip PGD warm start and use the clean input image directly')
 parser.add_argument('--save_intermediates', action='store_true', help='Save clean / PGD / inversion / final images for diagnosis')
 parser.add_argument('--intermediate_root', default='', type=str, help='Root directory for intermediate images and per-image metadata')
+parser.add_argument('--pseudo_label_csv', default='', type=str, help='Optional CSV with image_id/image_path/prompt_text for per-image pseudo labels')
+parser.add_argument('--cross_attn_loss_weight', default=0.0, type=float, help='Cross-attention regularization loss weight (lambda_c)')
+parser.add_argument('--cross_attn_layers', default='', type=str, help='Comma-separated cross-attention layer names or block ids')
+parser.add_argument('--cross_attn_max_layers', default=5, type=int, help='Maximum number of representative cross-attention layers to regularize')
 parser.add_argument('--self_attn_loss_weight', default=0.0, type=float, help='Self-attention preservation loss weight (gamma)')
 parser.add_argument('--self_attn_layers', default='', type=str, help='Comma-separated self-attention layer names or block ids')
 parser.add_argument('--self_attn_max_layers', default=5, type=int, help='Maximum number of representative self-attention layers to regularize')
@@ -149,6 +155,46 @@ def seed_torch(seed=42):
 
 
 seed_torch(42)
+
+
+def _fake_suffix(path: Path) -> str:
+    parts = list(path.parts)
+    lowered = [part.lower() for part in parts]
+    if 'fake' not in lowered:
+        return path.name
+    idx = lowered.index('fake')
+    return '/'.join(['fake', *parts[idx + 1 :]])
+
+
+def load_pseudo_prompt_map(csv_path) -> dict[str, dict[str, str]]:
+    if not csv_path:
+        return {'by_image_id': {}, 'by_suffix': {}}
+
+    by_image_id: dict[str, str] = {}
+    by_suffix: dict[str, str] = {}
+    with Path(csv_path).open('r', newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            prompt = row['prompt_text'].strip()
+            if not prompt:
+                raise ValueError(f'Empty prompt_text row in {csv_path}: {row}')
+            image_id = row['image_id'].strip()
+            if image_id:
+                by_image_id[image_id] = prompt
+            image_path = row['image_path'].strip()
+            if image_path:
+                by_suffix[_fake_suffix(Path(image_path))] = prompt
+    return {'by_image_id': by_image_id, 'by_suffix': by_suffix}
+
+
+def resolve_prompt_text(image_path: str, prompt_map: dict[str, dict[str, str]]) -> str | None:
+    by_suffix = prompt_map['by_suffix']
+    by_image_id = prompt_map['by_image_id']
+    path = Path(image_path)
+    suffix = _fake_suffix(path)
+    if suffix in by_suffix:
+        return by_suffix[suffix]
+    return by_image_id.get(path.stem)
 
 
 def _infer_pipeline_class(pretrained_diffusion_path: str):
@@ -203,6 +249,7 @@ def run_diffusion_attack(
     args=None,
     intermediate_dir=None,
     image_path=None,
+    prompt_text=None,
 ):
     # Note: the actual file save is handled inside diff_latent_attack.diffattack().
     attack_image = image
@@ -227,6 +274,7 @@ def run_diffusion_attack(
         idx=0,
         intermediate_dir=intermediate_dir,
         image_path=image_path,
+        prompt_text=prompt_text,
     )
     adv_image = np.array(adv_image)
     return adv_image, adv_acc, adv_acc1, adv_acc2, adv_acc3, psnr, ssim
@@ -236,6 +284,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.lambda_perc is not None:
         args.lambda_lpips = args.lambda_perc
+    prompt_map = load_pseudo_prompt_map(args.pseudo_label_csv)
     guidance = args.guidance
     diffusion_steps = args.diffusion_steps  # Total DDIM sampling steps.
     start_step = args.start_step  # Which DDIM step to start the attack.
@@ -475,6 +524,9 @@ if __name__ == "__main__":
             for ind, image_path in enumerate(all_images):
                 in_p = Path(image_path)
                 tmp_image = Image.open(image_path).convert("RGB")
+                prompt_text = resolve_prompt_text(str(in_p), prompt_map)
+                if (args.cross_attn_loss_weight > 0 or args.pseudo_label_csv) and not prompt_text:
+                    raise KeyError(f"Missing prompt_text for image_path={in_p}")
 
                 # Compute output relative path under fake/.
                 rel = None
@@ -518,6 +570,7 @@ if __name__ == "__main__":
                     save_dir="",
                     intermediate_dir=str(intermediate_dir) if intermediate_dir is not None else None,
                     image_path=str(in_p),
+                    prompt_text=prompt_text,
                 )
 
                 adv_all_acc += adv_acc
@@ -531,6 +584,7 @@ if __name__ == "__main__":
                         "index": ind,
                         "image_path": str(in_p),
                         "adv_path": str(out_p),
+                        "prompt_text": prompt_text or "",
                         "acc_main": float(adv_acc),
                         "acc_supp": float(adv_acc1),
                         "acc_supp1": float(adv_acc2),
@@ -583,6 +637,9 @@ if __name__ == "__main__":
 
         for ind, image_path in enumerate(all_images):
             tmp_image = Image.open(image_path).convert("RGB")
+            prompt_text = resolve_prompt_text(str(Path(image_path)), prompt_map)
+            if (args.cross_attn_loss_weight > 0 or args.pseudo_label_csv) and not prompt_text:
+                raise KeyError(f"Missing prompt_text for image_path={image_path}")
             if args.save_origin:
                 tmp_image.save(os.path.join(save_dir, str(ind).rjust(4, "0") + "_originImage.png"))
 
@@ -608,6 +665,7 @@ if __name__ == "__main__":
                 out_path_adv=out_p,
                 intermediate_dir=str(intermediate_dir) if intermediate_dir is not None else None,
                 image_path=str(Path(image_path)),
+                prompt_text=prompt_text,
             )
 
             adv_all_acc += adv_acc
@@ -621,6 +679,7 @@ if __name__ == "__main__":
                     "index": ind,
                     "image_path": str(Path(image_path)),
                     "adv_path": str(out_p),
+                    "prompt_text": prompt_text or "",
                     "acc_main": float(adv_acc),
                     "acc_supp": float(adv_acc1),
                     "acc_supp1": float(adv_acc2),

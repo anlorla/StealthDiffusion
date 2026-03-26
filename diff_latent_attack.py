@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 # os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 import numpy as np
@@ -24,6 +26,7 @@ from diffusers.models.autoencoder_kl import (
 )
 from ControlVAE import NewEncoder, NewDecoder, NewAutoencoderKL
 import torchattacks
+from cross_attn_regularizer import CrossAttentionRegularizer
 from self_attn_regularizer import SelfAttentionRegularizer
 
 
@@ -384,6 +387,49 @@ def build_context(
     return context
 
 
+def resolve_prompt_text_for_attack(imagenet_label, label_value: int, prompt_text):
+    base_prompt = (prompt_text or imagenet_label.refined_Label[label_value]).strip()
+    if not base_prompt:
+        raise ValueError('Resolved prompt_text is empty')
+    return base_prompt
+
+
+def resolve_prompt_token_indices(tokenizer, prompt_text: str):
+    max_length = getattr(tokenizer, 'model_max_length', 77)
+    token_kwargs = {
+        'padding': 'max_length',
+        'max_length': max_length,
+        'truncation': True,
+        'return_tensors': 'pt',
+    }
+    try:
+        encoded = tokenizer([prompt_text], return_special_tokens_mask=True, **token_kwargs)
+    except TypeError:
+        encoded = tokenizer([prompt_text], **token_kwargs)
+
+    input_ids = encoded['input_ids'][0]
+    attention_mask = encoded.get('attention_mask', torch.ones_like(input_ids))[0]
+    special_mask = encoded.get('special_tokens_mask')
+    if special_mask is not None:
+        special_mask = special_mask[0]
+
+    token_indices = []
+    for idx in range(int(input_ids.shape[0])):
+        if int(attention_mask[idx].item()) == 0:
+            continue
+        if special_mask is not None and int(special_mask[idx].item()) == 1:
+            continue
+        token_indices.append(idx)
+
+    if token_indices:
+        return token_indices
+
+    active = [idx for idx in range(int(input_ids.shape[0])) if int(attention_mask[idx].item()) == 1]
+    if len(active) > 2:
+        return active[1:-1]
+    return active
+
+
 def get_model_prediction(model, latents, context, t, guidance_scale):
     latents_input = torch.cat([latents] * 2)
 
@@ -596,6 +642,7 @@ def diffattack(
     out_path_adv=None,
     intermediate_dir=None,
     image_path=None,
+    prompt_text=None,
 ):
     if args.dataset_name == "ours_try":
         from dataset_caption import ours_label as imagenet_label
@@ -623,6 +670,8 @@ def diffattack(
         meta = {"idx": idx}
         if image_path is not None:
             meta["image_path"] = image_path
+        if prompt_text is not None:
+            meta["prompt_text"] = prompt_text
         with (intermediate_dir_path / "meta.json").open("w", encoding="utf-8") as f:
             import json
             json.dump(meta, f, indent=2, ensure_ascii=False)
@@ -775,20 +824,25 @@ def diffattack(
 
     # 这块其实没用 top-k 的 label，只是打印
     _, pred_labels = pred.topk(topN, largest=True, sorted=True)
-    target_prompt = " ".join(
-        [imagenet_label.refined_Label[label.item()] for _ in range(1, topN)]
+    base_prompt = resolve_prompt_text_for_attack(
+        imagenet_label,
+        int(label[0].item()),
+        prompt_text,
     )
-
-    prompt = [""] * 2
+    prompt = [base_prompt] * 2
     logger.info(
         f"prompt generate: {prompt[0]} \tlabels: {pred_labels.cpu().numpy().tolist()}"
     )
 
-    true_label = model.tokenizer.encode(imagenet_label.refined_Label[label.item()])
-    target_label = model.tokenizer.encode(target_prompt)
-    logger.info(f"decoder: {true_label}, {target_label}")
+    prompt_token_indices = resolve_prompt_token_indices(model.tokenizer, base_prompt)
+    if getattr(args, 'cross_attn_loss_weight', 0.0) > 0 and not prompt_token_indices:
+        raise ValueError(f"No valid prompt token indices resolved for prompt_text={base_prompt!r}")
+    if hasattr(model.tokenizer, 'encode'):
+        decoder_tokens = model.tokenizer.encode(base_prompt)
+        logger.info(f"decoder: {decoder_tokens}")
+    logger.info(f"[PROMPT] base_prompt={base_prompt!r} token_indices={prompt_token_indices}")
 
-    init_prompt = [""]
+    init_prompt = [base_prompt]
 
     batch_size_init = len(init_prompt)
     all_uncond_emb = []
@@ -916,6 +970,9 @@ def diffattack(
     lpips.requires_grad_(False)
 
     self_attn_weight = float(getattr(args, "self_attn_loss_weight", 0.0))
+    cross_attn_weight = float(getattr(args, "cross_attn_loss_weight", 0.0))
+    cross_attn_regularizer = None
+    cross_attn_loss = torch.tensor(0.0, device=device)
     self_attn_regularizer = None
     self_attn_loss = torch.tensor(0.0, device=device)
 
@@ -987,6 +1044,17 @@ def diffattack(
         "norm_num_groups": params["norm_num_groups"],
     }
 
+    if cross_attn_weight > 0:
+        cross_attn_regularizer = CrossAttentionRegularizer.from_unet(
+            model.unet,
+            token_indices=prompt_token_indices,
+            layers=str(getattr(args, "cross_attn_layers", "")),
+            max_layers=int(getattr(args, "cross_attn_max_layers", 5)),
+        )
+        logger.info(
+            f"[CROSS-ATTN] enabled weight={cross_attn_weight:.4f} layers={cross_attn_regularizer.layer_names} token_indices={prompt_token_indices}"
+        )
+
     if self_attn_weight > 0:
         self_attn_regularizer = SelfAttentionRegularizer.from_unet(
             model.unet,
@@ -1036,6 +1104,8 @@ def diffattack(
 
         if self_attn_regularizer is not None:
             self_attn_regularizer.begin_compare()
+        if cross_attn_regularizer is not None:
+            cross_attn_regularizer.begin()
 
         # 扩散去噪
         for ind, t in enumerate(active_timesteps):
@@ -1051,6 +1121,10 @@ def diffattack(
             self_attn_loss = self_attn_regularizer.end_compare(device=device)
         else:
             self_attn_loss = torch.tensor(0.0, device=device)
+        if cross_attn_regularizer is not None:
+            cross_attn_loss = cross_attn_regularizer.end(device=device)
+        else:
+            cross_attn_loss = torch.tensor(0.0, device=device)
 
         decode_latents = (latents / get_scaling_factor(model)).to(dtype=vae_dtype)
 
@@ -1118,6 +1192,7 @@ def diffattack(
             + lambda_l1 * l1_loss_val
             + lambda_lpips * lpips_loss
             + lambda_latent * l1_loss_latent
+            + cross_attn_weight * cross_attn_loss
             + self_attn_weight * self_attn_loss
         )
 
@@ -1140,6 +1215,7 @@ def diffattack(
                 f"l1_loss: {l1_loss_val.item():.5f} "
                 f"l1_loss_latent: {l1_loss_latent.item():.5f} "
                 f"lpips_loss: {lpips_loss.item():.5f} "
+                f"cross_attn_loss: {float(cross_attn_loss.item()):.5f} "
                 f"self_attn_loss: {float(self_attn_loss.item()):.5f} "
                 f"loss: {loss.item():.5f}"
             )
@@ -1208,6 +1284,10 @@ def diffattack(
     if self_attn_regularizer is not None:
         logger.info(
             f"[SELF-ATTN] final layers={self_attn_regularizer.layer_names} weight={self_attn_weight:.4f}"
+        )
+    if cross_attn_regularizer is not None:
+        logger.info(
+            f"[CROSS-ATTN] final layers={cross_attn_regularizer.layer_names} weight={cross_attn_weight:.4f} token_indices={prompt_token_indices} calls={cross_attn_regularizer.call_counts}"
         )
 
     # ====== decode 成图像 ======
@@ -1393,6 +1473,8 @@ def diffattack(
 
     if self_attn_regularizer is not None:
         self_attn_regularizer.close()
+    if cross_attn_regularizer is not None:
+        cross_attn_regularizer.close()
 
     # Return accuracies (not class indices). `main.py` aggregates these across images.
     return (
