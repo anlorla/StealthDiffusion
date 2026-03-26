@@ -113,6 +113,9 @@ parser.add_argument('--backbone_gradient_checkpointing', default=0, type=int, he
 parser.add_argument('--backbone_gc_vae', default=0, type=int, help='If 1 together with --backbone_gradient_checkpointing, also enable VAE gradient checkpointing')
 parser.add_argument('--save_intermediates', action='store_true', help='Save run args and metrics for smoke / diagnostics')
 parser.add_argument('--intermediate_root', default='', type=str, help='Root directory for run-side metadata and optional intermediates')
+parser.add_argument('--self_attn_loss_weight', default=0.0, type=float, help='Self-attention preservation loss weight (gamma)')
+parser.add_argument('--self_attn_layers', default='', type=str, help='Comma-separated self-attention layer names or PixArt block ids')
+parser.add_argument('--self_attn_max_layers', default=5, type=int, help='Maximum number of representative self-attention layers to regularize')
 
 def seed_torch(seed=42):
     """For reproducibility"""
