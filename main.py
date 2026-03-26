@@ -132,6 +132,9 @@ parser.add_argument(
 parser.add_argument('--disable_pgd_warm_start', action='store_true', help='Skip PGD warm start and use the clean input image directly')
 parser.add_argument('--save_intermediates', action='store_true', help='Save clean / PGD / inversion / final images for diagnosis')
 parser.add_argument('--intermediate_root', default='', type=str, help='Root directory for intermediate images and per-image metadata')
+parser.add_argument('--self_attn_loss_weight', default=0.0, type=float, help='Self-attention preservation loss weight (gamma)')
+parser.add_argument('--self_attn_layers', default='', type=str, help='Comma-separated self-attention layer names or block ids')
+parser.add_argument('--self_attn_max_layers', default=5, type=int, help='Maximum number of representative self-attention layers to regularize')
 
 def seed_torch(seed=42):
     """For reproducibility"""

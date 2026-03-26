@@ -24,6 +24,7 @@ from diffusers.models.autoencoder_kl import (
 )
 from ControlVAE import NewEncoder, NewDecoder, NewAutoencoderKL
 import torchattacks
+from self_attn_regularizer import SelfAttentionRegularizer
 
 
 # --------------------------------------------
@@ -914,6 +915,10 @@ def diffattack(
     lpips = LPIPS(net="vgg").cuda()
     lpips.requires_grad_(False)
 
+    self_attn_weight = float(getattr(args, "self_attn_loss_weight", 0.0))
+    self_attn_regularizer = None
+    self_attn_loss = torch.tensor(0.0, device=device)
+
     # 预处理后的图像也做一次 nan_to_num，避免后面参与 loss 出问题
     if freqsep_enabled:
         init_image = freqsep_base_diffusion
@@ -982,6 +987,27 @@ def diffattack(
         "norm_num_groups": params["norm_num_groups"],
     }
 
+    if self_attn_weight > 0:
+        self_attn_regularizer = SelfAttentionRegularizer.from_unet(
+            model.unet,
+            layers=str(getattr(args, "self_attn_layers", "")),
+            max_layers=int(getattr(args, "self_attn_max_layers", 5)),
+            loss_type="mse",
+        )
+        logger.info(
+            f"[SELF-ATTN] enabled weight={self_attn_weight:.4f} layers={self_attn_regularizer.layer_names}"
+        )
+        reset_scheduler_state(model)
+        with torch.no_grad():
+            self_attn_regularizer.begin_reference()
+            ref_latents = torch.cat([original_latent, original_latent], dim=0)
+            for ind, t in enumerate(active_timesteps):
+                ref_latents = diffusion_step(model, ref_latents, context[ind], t, guidance_scale)
+                ref_latents = torch.nan_to_num(ref_latents, nan=0.0, posinf=5.0, neginf=-5.0).clamp_(-5.0, 5.0)
+            self_attn_regularizer.end_reference()
+        ref_step_counts = {name: len(vals) for name, vals in self_attn_regularizer.references.items()}
+        logger.info(f"[SELF-ATTN] cached reference steps={ref_step_counts}")
+
     # ---- latent 迭代优化 ----
     pbar = tqdm(range(iterations), desc="Iterations")
     for _iter, _ in enumerate(pbar):
@@ -1008,6 +1034,9 @@ def diffattack(
             latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
         latents = latents.clamp_(-5.0, 5.0)
 
+        if self_attn_regularizer is not None:
+            self_attn_regularizer.begin_compare()
+
         # 扩散去噪
         for ind, t in enumerate(active_timesteps):
             latents = diffusion_step(model, latents, context[ind], t, guidance_scale)
@@ -1017,6 +1046,11 @@ def diffattack(
                 )
                 latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
             latents = latents.clamp_(-5.0, 5.0)
+
+        if self_attn_regularizer is not None:
+            self_attn_loss = self_attn_regularizer.end_compare(device=device)
+        else:
+            self_attn_loss = torch.tensor(0.0, device=device)
 
         decode_latents = (latents / get_scaling_factor(model)).to(dtype=vae_dtype)
 
@@ -1084,6 +1118,7 @@ def diffattack(
             + lambda_l1 * l1_loss_val
             + lambda_lpips * lpips_loss
             + lambda_latent * l1_loss_latent
+            + self_attn_weight * self_attn_loss
         )
 
         if torch.isnan(loss) or torch.isinf(loss):
@@ -1105,6 +1140,7 @@ def diffattack(
                 f"l1_loss: {l1_loss_val.item():.5f} "
                 f"l1_loss_latent: {l1_loss_latent.item():.5f} "
                 f"lpips_loss: {lpips_loss.item():.5f} "
+                f"self_attn_loss: {float(self_attn_loss.item()):.5f} "
                 f"loss: {loss.item():.5f}"
             )
 
@@ -1168,6 +1204,11 @@ def diffattack(
                 )
                 latents = torch.nan_to_num(latents, nan=0.0, posinf=5.0, neginf=-5.0)
             latents = latents.clamp_(-5.0, 5.0)
+
+    if self_attn_regularizer is not None:
+        logger.info(
+            f"[SELF-ATTN] final layers={self_attn_regularizer.layer_names} weight={self_attn_weight:.4f}"
+        )
 
     # ====== decode 成图像 ======
     if args.is_encoder == 1:
@@ -1349,6 +1390,9 @@ def diffattack(
 
     logger.info(f"psnrv: {psnrv}")
     logger.info(f"ssimv: {ssimv}")
+
+    if self_attn_regularizer is not None:
+        self_attn_regularizer.close()
 
     # Return accuracies (not class indices). `main.py` aggregates these across images.
     return (
