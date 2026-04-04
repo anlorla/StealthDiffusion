@@ -13,7 +13,9 @@ from utils import view_images, aggregate_attention
 from distances import LpDistance
 import cv2
 import math
+import json
 from lpips import LPIPS
+from diffusers import EulerDiscreteScheduler
 from diffusers.models.autoencoder_kl import (
     AutoencoderKL,
     Encoder,
@@ -23,9 +25,14 @@ from diffusers.models.autoencoder_kl import (
     DecoderOutput,
 )
 from ControlVAE import NewEncoder, NewDecoder, NewAutoencoderKL
+from models.network_dncnn import DnCNN as DnCNNNet
 import torchattacks
 from cross_attn_regularizer import CrossAttentionRegularizer
 from self_attn_regularizer import SelfAttentionRegularizer
+
+
+_DNCNN_RESIDUAL_CACHE: dict[str, torch.nn.Module] = {}
+_LPIPS_CACHE: dict[str, torch.nn.Module] = {}
 
 
 # --------------------------------------------
@@ -116,6 +123,90 @@ def preprocess(image, res=512, device=None, dtype=torch.float32):
     return 2.0 * image - 1.0
 
 
+def neg1pos1_to_01(image_tensor):
+    return ((image_tensor.float() + 1.0) * 0.5).clamp(0.0, 1.0)
+
+
+def rgb01_to_gray(image_tensor):
+    return (
+        0.2989 * image_tensor[:, 0, :, :]
+        + 0.5870 * image_tensor[:, 1, :, :]
+        + 0.1140 * image_tensor[:, 2, :, :]
+    )
+
+
+def spectrum_log_amplitude_torch(gray_01):
+    freq = torch.fft.fft2(gray_01.float(), dim=(-2, -1))
+    freq = torch.fft.fftshift(freq, dim=(-2, -1))
+    return torch.log1p(torch.abs(freq))
+
+
+def load_dncnn_residual_extractor(device):
+    device = torch.device(device)
+    cache_key = str(device)
+    cached = _DNCNN_RESIDUAL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    checkpoint_path = Path("/root/gpufree-data/checkpoints/dncnn_color_blind.pth")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Missing DnCNN checkpoint: {checkpoint_path}")
+
+    state = torch.load(str(checkpoint_path), map_location="cpu")
+    first_weight = next(v for k, v in state.items() if k.endswith(".weight") and v.ndim == 4)
+    last_weight = next(v for k, v in reversed(list(state.items())) if k.endswith(".weight") and v.ndim == 4)
+    num_convs = sum(1 for k, v in state.items() if k.endswith(".weight") and v.ndim == 4)
+    act_mode = "BR" if any(k.endswith("running_mean") for k in state) else "R"
+
+    model = DnCNNNet(
+        in_nc=int(first_weight.shape[1]),
+        out_nc=int(last_weight.shape[0]),
+        nc=int(first_weight.shape[0]),
+        nb=int(num_convs),
+        act_mode=act_mode,
+    )
+    model.load_state_dict(state, strict=True)
+    model = model.to(device).eval()
+    model.requires_grad_(False)
+    _DNCNN_RESIDUAL_CACHE[cache_key] = model
+    return model
+
+
+def load_lpips_metric(device):
+    device = torch.device(device)
+    cache_key = str(device)
+    cached = _LPIPS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    model = LPIPS(net="vgg").to(device)
+    model.requires_grad_(False)
+    model.eval()
+    _LPIPS_CACHE[cache_key] = model
+    return model
+
+
+def compute_frequency_alignment_loss(pred_image, target_image, residual_extractor):
+    pred_01 = neg1pos1_to_01(pred_image)
+    target_01 = neg1pos1_to_01(target_image)
+
+    pred_spec = spectrum_log_amplitude_torch(rgb01_to_gray(pred_01))
+    target_spec = spectrum_log_amplitude_torch(rgb01_to_gray(target_01))
+    img_freq_loss = torch.nn.functional.mse_loss(pred_spec, target_spec)
+
+    if residual_extractor is None:
+        zero = torch.zeros((), device=pred_image.device, dtype=img_freq_loss.dtype)
+        return img_freq_loss, img_freq_loss, zero
+
+    pred_residual = residual_extractor(pred_01)
+    target_residual = residual_extractor(target_01)
+    pred_residual_spec = spectrum_log_amplitude_torch(rgb01_to_gray(pred_residual))
+    target_residual_spec = spectrum_log_amplitude_torch(rgb01_to_gray(target_residual))
+    residual_freq_loss = torch.nn.functional.mse_loss(pred_residual_spec, target_residual_spec)
+    total_freq_loss = 0.5 * (img_freq_loss + residual_freq_loss)
+    return total_freq_loss, img_freq_loss, residual_freq_loss
+
+
 def is_pixart_alpha_backbone(model):
     return model.__class__.__name__ == "PixArtAlphaPipeline" or hasattr(model, "transformer")
 
@@ -165,6 +256,22 @@ def ensure_core_pipeline_modules_on_device(model):
     module_names.append("transformer" if is_pixart_alpha_backbone(model) else "unet")
     move_pipeline_modules_to_device(model, module_names, device)
     return device
+
+
+def ensure_scheduler_tensors_on_device(scheduler, device):
+    device = torch.device(device)
+    for name in (
+        "timesteps",
+        "sigmas",
+        "alphas_cumprod",
+        "final_alpha_cumprod",
+        "alphas",
+        "betas",
+    ):
+        value = getattr(scheduler, name, None)
+        if torch.is_tensor(value) and value.device != device:
+            setattr(scheduler, name, value.to(device))
+    return scheduler
 
 
 def offload_unused_conditioning_modules(model):
@@ -322,6 +429,9 @@ def resolve_prompt_token_indices(tokenizer, prompt_text: str):
 
 def get_model_prediction(model, latents, context, t, guidance_scale):
     ensure_core_pipeline_modules_on_device(model)
+    denoiser_param = next(get_denoiser(model).parameters())
+    ensure_scheduler_tensors_on_device(model.scheduler, denoiser_param.device)
+    latents = latents.to(device=denoiser_param.device, dtype=denoiser_param.dtype)
     latent_model_input = torch.cat([latents] * 2)
 
     if is_pixart_alpha_backbone(model):
@@ -458,6 +568,84 @@ def ddim_reverse_sample(
     return latents, all_latents
 
 
+def build_start_latent(
+    image,
+    prompt,
+    model,
+    num_inference_steps: int,
+    res: int,
+    start_step: int,
+    startpoint_mode: str,
+):
+    ensure_core_pipeline_modules_on_device(model)
+    exec_device = get_pipeline_execution_device(model)
+    model.scheduler.set_timesteps(num_inference_steps, device=exec_device)
+    timesteps = model.scheduler.timesteps
+
+    if startpoint_mode == "ddim_inversion":
+        latent, inversion_latents = ddim_reverse_sample(
+            image,
+            prompt,
+            model,
+            num_inference_steps,
+            0,
+            res=res,
+        )
+        inversion_latents = inversion_latents[::-1]
+        chosen_index = max(0, min(int(start_step) - 1, len(inversion_latents) - 1))
+        latent = inversion_latents[chosen_index]
+        active_timesteps = timesteps[chosen_index + 1 :]
+        chosen_timestep = active_timesteps[0] if len(active_timesteps) > 0 else torch.tensor(0, device=timesteps.device, dtype=timesteps.dtype)
+        return {
+            "latent": latent,
+            "active_timesteps": active_timesteps,
+            "requested_start_step": int(start_step),
+            "chosen_index": int(chosen_index),
+            "chosen_timestep": chosen_timestep,
+            "startpoint_family": "ddim",
+            "startpoint_value": f"t_start_{int(start_step)}",
+        }
+
+    z0 = encoder(image, model, res=res, sample_posterior=True)
+    z0 = z0.to(device=exec_device, dtype=next(get_denoiser(model).parameters()).dtype)
+
+    if startpoint_mode == "clean_latent":
+        active_timesteps = timesteps[:0]
+        return {
+            "latent": z0,
+            "active_timesteps": active_timesteps,
+            "requested_start_step": int(start_step),
+            "chosen_index": int(len(timesteps)),
+            "chosen_timestep": torch.tensor(0, device=timesteps.device, dtype=timesteps.dtype),
+            "startpoint_family": "clean",
+            "startpoint_value": "z0",
+        }
+
+    if startpoint_mode == "euler_add_noise":
+        euler_scheduler = EulerDiscreteScheduler.from_config(dict(model.scheduler.config))
+        euler_scheduler.set_timesteps(num_inference_steps, device=exec_device)
+        euler_timesteps = euler_scheduler.timesteps
+        sigma_index = max(0, min(int(start_step), len(euler_timesteps) - 1))
+        chosen_t = euler_timesteps[sigma_index]
+        active_timesteps = timesteps[sigma_index:]
+        noise = torch.randn_like(z0)
+        zt = euler_scheduler.add_noise(z0, noise, chosen_t.unsqueeze(0))
+        zt = zt.to(device=exec_device, dtype=next(get_denoiser(model).parameters()).dtype)
+        sigma_value = float(euler_scheduler.sigmas[sigma_index].item()) if hasattr(euler_scheduler, "sigmas") else float("nan")
+        return {
+            "latent": zt,
+            "active_timesteps": active_timesteps,
+            "requested_start_step": int(start_step),
+            "chosen_index": int(sigma_index),
+            "chosen_timestep": chosen_t,
+            "sigma_value": sigma_value,
+            "startpoint_family": "euler",
+            "startpoint_value": f"sigma_{sigma_index}",
+        }
+
+    raise ValueError(f"Unsupported startpoint_mode={startpoint_mode!r}")
+
+
 def init_latent(latent, model, height, width, batch_size):
     denoiser = get_denoiser(model)
     latents = latent.expand(
@@ -467,8 +655,12 @@ def init_latent(latent, model, height, width, batch_size):
 
 
 def diffusion_step(model, latents, context, t, guidance_scale):
+    denoiser_param = next(get_denoiser(model).parameters())
+    ensure_scheduler_tensors_on_device(model.scheduler, denoiser_param.device)
+    latents = latents.to(device=denoiser_param.device, dtype=denoiser_param.dtype)
     noise_pred = get_model_prediction(model, latents, context, t, guidance_scale)
     latents = model.scheduler.step(noise_pred, t, latents)["prev_sample"]
+    latents = latents.to(device=denoiser_param.device, dtype=denoiser_param.dtype)
     return latents
 
 
@@ -530,6 +722,27 @@ def diffattack(
     classifier_supp = classifier_supp.eval()
     classifier_supp1 = classifier_supp1.eval()
     classifier_supp2 = classifier_supp2.eval()
+    ordered_names = [s.strip() for s in str(getattr(args, "model_name", "E,R,D,S")).split(",") if s.strip()]
+    if len(ordered_names) != 4:
+        raise ValueError(f"Expected 4 detector names in args.model_name, got {ordered_names}")
+    classifier_map = {
+        ordered_names[0]: classifier,
+        ordered_names[1]: classifier_supp,
+        ordered_names[2]: classifier_supp1,
+        ordered_names[3]: classifier_supp2,
+    }
+    attack_surrogates_raw = str(getattr(args, "attack_surrogates", "")).strip()
+    if attack_surrogates_raw:
+        attack_surrogates = [s.strip() for s in attack_surrogates_raw.split(",") if s.strip()]
+    else:
+        attack_surrogates = [ordered_names[0]]
+    if len(set(attack_surrogates)) != len(attack_surrogates):
+        raise ValueError(f"Duplicate names in attack_surrogates={attack_surrogates}")
+    unknown_attack = [s for s in attack_surrogates if s not in classifier_map]
+    if unknown_attack:
+        raise ValueError(
+            f"attack_surrogates contains names outside model_name order: {unknown_attack} vs {ordered_names}"
+        )
 
     height = width = res
 
@@ -642,33 +855,55 @@ def diffattack(
         logger.info("decoder token ids unavailable for current backbone")
     logger.info(f"[PROMPT] base_prompt={base_prompt!r} token_indices={prompt_token_indices}")
 
-    # ==========================================
-    # ============ DDIM Inversion ==============
-    # ==========================================
-    latent, inversion_latents = ddim_reverse_sample(
-        image,
-        prompt,
-        model,
-        num_inference_steps,
-        0,
+    startpoint_mode = str(getattr(args, "startpoint_mode", "ddim_inversion"))
+    start_state = build_start_latent(
+        image=image,
+        prompt=prompt,
+        model=model,
+        num_inference_steps=num_inference_steps,
         res=height,
+        start_step=start_step,
+        startpoint_mode=startpoint_mode,
     )
-    inversion_latents = inversion_latents[::-1]
-
-    with torch.no_grad():
-        for k, z in enumerate(inversion_latents):
-            print(
-                f"[INV] step {k}: mean={z.mean().item():.4f}, std={z.std().item():.4f}, "
-                f"nan={torch.isnan(z).any().item()}, inf={torch.isinf(z).any().item()}"
-            )
-
-    latent = inversion_latents[start_step - 1]
-
-    print(
-        f"[INV] chosen latent (step {start_step-1}): "
-        f"mean={latent.mean().item():.4f}, std={latent.std().item():.4f}, "
-        f"nan={torch.isnan(latent).any().item()}, inf={torch.isinf(latent).any().item()}"
+    latent = start_state["latent"]
+    active_timesteps = start_state["active_timesteps"]
+    chosen_timestep = start_state["chosen_timestep"]
+    logger.info(
+        "[STARTPOINT] mode=%s family=%s requested_start_step=%s chosen_index=%s chosen_timestep=%s startpoint_value=%s",
+        startpoint_mode,
+        start_state.get("startpoint_family", ""),
+        start_state.get("requested_start_step", ""),
+        start_state.get("chosen_index", ""),
+        float(chosen_timestep.item()) if torch.is_tensor(chosen_timestep) else chosen_timestep,
+        start_state.get("startpoint_value", ""),
     )
+    if "sigma_value" in start_state:
+        logger.info("[STARTPOINT] euler_sigma=%.6f", float(start_state["sigma_value"]))
+    logger.info(
+        "[STARTPOINT] latent mean=%.4f std=%.4f nan=%s inf=%s active_steps=%d",
+        latent.mean().item(),
+        latent.std().item(),
+        bool(torch.isnan(latent).any().item()),
+        bool(torch.isinf(latent).any().item()),
+        int(len(active_timesteps)),
+    )
+    if getattr(args, "save_intermediates", False) and getattr(args, "intermediate_root", ""):
+        meta_path = Path(args.intermediate_root) / "startpoint_meta.json"
+        meta = {
+            "startpoint_mode": startpoint_mode,
+            "startpoint_family": start_state.get("startpoint_family", ""),
+            "startpoint_value": start_state.get("startpoint_value", ""),
+            "requested_start_step": int(start_state.get("requested_start_step", start_step)),
+            "chosen_index": int(start_state.get("chosen_index", 0)),
+            "chosen_timestep": float(chosen_timestep.item()) if torch.is_tensor(chosen_timestep) else chosen_timestep,
+            "active_step_count": int(len(active_timesteps)),
+            "latent_mean": float(latent.mean().item()),
+            "latent_std": float(latent.std().item()),
+        }
+        if "sigma_value" in start_state:
+            meta["sigma_value"] = float(start_state["sigma_value"])
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     init_prompt = [base_prompt]
 
@@ -688,7 +923,6 @@ def diffattack(
                 f"nan={torch.isnan(z).any().item()}, inf={torch.isinf(z).any().item()}"
             )
 
-    active_timesteps = model.scheduler.timesteps[1 + start_step - 1 :]
     for _ind, _t in enumerate(
         tqdm(active_timesteps, desc="Optimize_uncond_embed")
     ):
@@ -743,15 +977,19 @@ def diffattack(
     optimizer = optim.AdamW([latent_opt], lr=float(getattr(args, "lr", 1e-3)))
     cross_entro = torch.nn.CrossEntropyLoss()
     loss_l1 = torch.nn.L1Loss()
-    lpips = LPIPS(net="vgg").cuda()
-    lpips.requires_grad_(False)
+    lpips = load_lpips_metric(device)
 
     self_attn_weight = float(getattr(args, "self_attn_loss_weight", 0.0))
     cross_attn_weight = float(getattr(args, "cross_attn_loss_weight", 0.0))
+    lambda_f = float(getattr(args, "lambda_f", 0.0))
     cross_attn_regularizer = None
     cross_attn_loss = torch.tensor(0.0, device=device)
     self_attn_regularizer = None
     self_attn_loss = torch.tensor(0.0, device=device)
+    frequency_residual_extractor = None
+    if lambda_f > 0:
+        frequency_residual_extractor = load_dncnn_residual_extractor(device)
+        logger.info(f"[FREQ-LOSS] enabled lambda_f={lambda_f:.4f}")
 
     # 预处理后的图像也做一次 nan_to_num，避免后面参与 loss 出问题
     init_image = preprocess(image, res, device=device, dtype=vae_dtype)
@@ -851,8 +1089,8 @@ def diffattack(
 
         latents = torch.cat(
             [
-                original_latent,
-                latent_opt.to(dtype=denoiser_dtype)
+                original_latent.to(device=device, dtype=denoiser_dtype),
+                latent_opt.to(device=device, dtype=denoiser_dtype),
             ],
             dim=0,
         )
@@ -888,7 +1126,8 @@ def diffattack(
         else:
             cross_attn_loss = torch.tensor(0.0, device=device)
 
-        decode_latents = (latents / get_scaling_factor(model)).to(dtype=vae_dtype)
+        # Only decode the adversarial branch; the clean reference branch is unused here.
+        decode_latents = (latents[1:] / get_scaling_factor(model)).to(dtype=vae_dtype)
 
         if torch.isnan(decode_latents).any() or torch.isinf(decode_latents).any():
             logger.warning("decode_latents has NaN/Inf, cleaning.")
@@ -897,7 +1136,7 @@ def diffattack(
             )
         decode_latents = decode_latents.clamp_(-5.0, 5.0)
 
-        init_out_image = model.vae.decode(decode_latents)["sample"][1:] * init_mask + (
+        init_out_image = model.vae.decode(decode_latents)["sample"] * init_mask + (
             1 - init_mask
         ) * init_image
 
@@ -912,14 +1151,35 @@ def diffattack(
         lpips_loss = lpips(init_image_compare.float(), init_out_image.float()).mean()
         l1_loss_val = loss_l1(init_image_compare, init_out_image)
         l1_loss_latent = loss_l1(original_latent.float(), latent_opt)
+        if lambda_f > 0:
+            freq_loss, img_freq_loss, residual_freq_loss = compute_frequency_alignment_loss(
+                init_out_image,
+                init_image_compare,
+                frequency_residual_extractor,
+            )
+        else:
+            freq_loss = torch.tensor(0.0, device=device)
+            img_freq_loss = torch.tensor(0.0, device=device)
+            residual_freq_loss = torch.tensor(0.0, device=device)
 
         out_image = (init_out_image / 2 + 0.5).clamp(0, 1)
 
         # 这里不能 no_grad，要让分类器的梯度反传回 latent
         out_image_clf = normalize(out_image.float())
         # out_image_clf = normalize(out_image)
-        pred_adv = classifier(out_image_clf) / 10.0
-        attack_loss = -cross_entro(pred_adv, label) * args.attack_loss_weight
+        attack_loss_terms = []
+        attack_loss_by_surrogate = {}
+        pred_adv = None
+        for surrogate_name in attack_surrogates:
+            pred_adv_current = classifier_map[surrogate_name](out_image_clf) / 10.0
+            if pred_adv is None and surrogate_name == ordered_names[0]:
+                pred_adv = pred_adv_current
+            attack_loss_current = -cross_entro(pred_adv_current, label) * args.attack_loss_weight
+            attack_loss_terms.append(attack_loss_current)
+            attack_loss_by_surrogate[surrogate_name] = float(attack_loss_current.detach().item())
+        if pred_adv is None:
+            pred_adv = classifier(out_image_clf) / 10.0
+        attack_loss = torch.stack(attack_loss_terms).mean()
 
         # Paper uses coefficients alpha, beta, gamma. Here:
         # - lambda_l1   (alpha) for pixel L1
@@ -934,6 +1194,7 @@ def diffattack(
             + lambda_l1 * l1_loss_val
             + lambda_lpips * lpips_loss
             + lambda_latent * l1_loss_latent
+            + lambda_f * freq_loss
             + cross_attn_weight * cross_attn_loss
             + self_attn_weight * self_attn_loss
         )
@@ -957,10 +1218,18 @@ def diffattack(
                 f"l1_loss: {l1_loss_val.item():.5f} "
                 f"l1_loss_latent: {l1_loss_latent.item():.5f} "
                 f"lpips_loss: {lpips_loss.item():.5f} "
+                f"freq_loss: {freq_loss.item():.5f} "
+                f"img_freq_loss: {img_freq_loss.item():.5f} "
+                f"residual_freq_loss: {residual_freq_loss.item():.5f} "
                 f"cross_attn_loss: {float(cross_attn_loss.item()):.5f} "
                 f"self_attn_loss: {float(self_attn_loss.item()):.5f} "
                 f"loss: {loss.item():.5f}"
             )
+            if len(attack_surrogates) > 1:
+                logger.info(
+                    f"[ENSEMBLE] attack_surrogates={attack_surrogates} "
+                    f"component_attack_loss={attack_loss_by_surrogate}"
+                )
 
     # ---- 最后再 decode 一次 ----
     with torch.no_grad():
@@ -1051,11 +1320,11 @@ def diffattack(
         decoder = None
         down_features = None
 
-        decode_latents = (latents.detach() / get_scaling_factor(model)).to(dtype=vae_dtype)
+        decode_latents = (latents.detach()[1:] / get_scaling_factor(model)).to(dtype=vae_dtype)
         decode_latents = torch.nan_to_num(
             decode_latents, nan=0.0, posinf=5.0, neginf=-5.0
         )
-        out_image = model.vae.decode(decode_latents)["sample"][1:] * init_mask + (
+        out_image = model.vae.decode(decode_latents)["sample"] * init_mask + (
             1 - init_mask
         ) * init_image
 

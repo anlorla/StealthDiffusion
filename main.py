@@ -82,6 +82,13 @@ parser.add_argument('--diffusion_steps', default=20, type=int, help='Total DDIM 
 parser.add_argument('--start_step',
                     default=18,
                     type=int, help='Which DDIM step to start the attack')
+parser.add_argument(
+    '--startpoint_mode',
+    default='ddim_inversion',
+    choices=['ddim_inversion', 'clean_latent', 'euler_add_noise'],
+    type=str,
+    help='How to construct the initial latent before LAO.',
+)
 parser.add_argument('--iterations',
                     default=10,
                     type=int, help='Iterations of optimizing the adv_image')
@@ -90,6 +97,12 @@ parser.add_argument('--res', default=224, type=int, help='Input image resized re
 parser.add_argument('--model_name',
                     default="E,R,D,S",
                     type=str, help='The surrogate model from which the adversarial examples are crafted')
+parser.add_argument(
+    '--attack_surrogates',
+    default='',
+    type=str,
+    help='Comma-separated seen surrogates used in the LAO attack loss; default uses only the first model in --model_name.',
+)
 parser.add_argument('--dataset_name',
                     default="ours_try",
                     type=str,
@@ -108,6 +121,7 @@ parser.add_argument('--pgd_alpha', default=None, type=float, help='PGD step size
 parser.add_argument('--lambda_l1', default=1.0, type=float, help='L1 loss coefficient (paper: alpha)')
 parser.add_argument('--lambda_lpips', default=1.0, type=float, help='LPIPS loss coefficient (paper: beta)')
 parser.add_argument('--lambda_latent', default=0.0, type=float, help='Latent L1 regularization coefficient (not in paper; default 0)')
+parser.add_argument('--lambda_f', default=0.0, type=float, help='Explicit frequency-alignment loss coefficient')
 parser.add_argument('--attack_only_fake', default=1, type=int, help='If 1, only craft adversarial examples for fake images')
 parser.add_argument('--max_per_source', default=0, type=int, help='If >0, sample up to N fake images per generator/source (paper: 100)')
 parser.add_argument('--seed', default=42, type=int, help='Random seed used for sampling')
@@ -293,7 +307,11 @@ if __name__ == "__main__":
     model_name = args.model_name.split(",")  # The surrogate model from which the adversarial examples are crafted.
 
     if args.dataset_name == "ours_try":
-        assert model_name in [["E", "R", "D", "S"], ["R", "E", "D", "S"], ["D", "E", "R", "S"], ["S", "E", "R", "D"]], f"There is no pretrained weight of {model_name} for RealFake dataset."
+        allowed = {"E", "R", "D", "S"}
+        if len(model_name) != 4 or set(model_name) != allowed or len(set(model_name)) != 4:
+            raise ValueError(
+                f"Invalid --model_name order {model_name}. Expected a permutation of {sorted(allowed)}."
+            )
 
 
     name = ""
