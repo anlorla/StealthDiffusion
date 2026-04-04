@@ -18,6 +18,7 @@ Baselines (inspired by StealthDiffusion_BigGAN/*):
   - fgsm:   FGSM on surrogate detector
   - pgd:    PGD on surrogate detector
   - blur:   gaussian blur (no gradients)
+  - jpeg:   jpeg recompression (no gradients)
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import csv
 import math
 import os
 import random
+from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -146,6 +148,16 @@ def pil_blur(img: Image.Image, sigma: float) -> Image.Image:
     return img.filter(ImageFilter.GaussianBlur(radius=float(sigma)))
 
 
+def pil_jpeg(img: Image.Image, quality: int) -> Image.Image:
+    quality = int(quality)
+    if not 1 <= quality <= 100:
+        raise ValueError(f"--jpeg_quality must be in [1, 100], got {quality}")
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
+
 def logits_to_score(logits: torch.Tensor) -> torch.Tensor:
     if logits.ndim != 2:
         raise ValueError(f"Unexpected logits shape: {tuple(logits.shape)}")
@@ -168,7 +180,7 @@ def predict_label(model: torch.nn.Module, x_norm: torch.Tensor) -> torch.Tensor:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--attack", choices=["downup", "fgsm", "pgd", "blur"], required=True)
+    ap.add_argument("--attack", choices=["downup", "fgsm", "pgd", "blur", "jpeg"], required=True)
     ap.add_argument("--images_root", required=True, help="Folder containing fake images (can have subset subfolders)")
     ap.add_argument("--save_dir", required=True, help="Output folder")
     ap.add_argument("--model_name", default="S,E,R,D", help="Comma-separated detector order; first is surrogate")
@@ -188,6 +200,7 @@ def main() -> int:
     ap.add_argument("--down_filter", type=str, default="LANCZOS")
     ap.add_argument("--up_filter", type=str, default="BICUBIC")
     ap.add_argument("--blur_sigma", type=float, default=1.0)
+    ap.add_argument("--jpeg_quality", type=int, default=70)
 
     args = ap.parse_args()
     seed_all(args.seed)
@@ -253,6 +266,8 @@ def main() -> int:
         logger.info(f"PGD eps={args.eps} alpha={args.pgd_alpha} steps={args.pgd_steps}")
     elif args.attack == "blur":
         logger.info(f"Blur sigma={args.blur_sigma}")
+    elif args.attack == "jpeg":
+        logger.info(f"JPEG quality={args.jpeg_quality}")
     else:
         logger.info(
             f"DownUp scale_w={args.scale_w} scale_h={args.scale_h} "
@@ -341,6 +356,8 @@ def main() -> int:
                     )
                 elif args.attack == "blur":
                     adv_im = pil_blur(im_resized, sigma=float(args.blur_sigma))
+                elif args.attack == "jpeg":
+                    adv_im = pil_jpeg(im_resized, quality=int(args.jpeg_quality))
                 else:
                     raise ValueError(f"Unsupported non-gradient attack: {args.attack}")
 

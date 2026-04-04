@@ -100,6 +100,18 @@ python scripts/run_baseline_attack.py \
   --blur_sigma 1.0
 ```
 
+## 5) JPEG compression baseline (black-box transform baseline)
+
+```bash
+python scripts/run_baseline_attack.py \
+  --attack jpeg \
+  --images_root /root/gpufree-data/dataset/original_genimage_eval_1400/fake \
+  --save_dir /root/gpufree-data/dataset/JPEG/attack_out/JPEG_genimage_eval_1400_surS \
+  --model_name "S,E,R,D" \
+  --res 224 \
+  --jpeg_quality 70
+```
+
 ## Evaluate baselines (post-attack)
 
 Build a dataroot:
@@ -122,7 +134,7 @@ python scripts/eval_detectors.py \
   --out_csv exp/results/adv_logits_pgd_surS.csv
 ```
 
-## 5) DiffAttack baseline (diffusion-latent attack)
+## 6) DiffAttack baseline (diffusion-latent attack)
 
 We provide a wrapper that runs DiffAttack code on our dataset while using our detectors (E/R/D/S) as surrogate.
 
