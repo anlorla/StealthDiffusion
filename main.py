@@ -111,6 +111,7 @@ parser.add_argument('--lambda_l1', default=1.0, type=float, help='L1 loss coeffi
 parser.add_argument('--lambda_lpips', default=1.0, type=float, help='LPIPS loss coefficient (paper: beta)')
 parser.add_argument('--lambda_perc', default=None, type=float, help='Alias of lambda_lpips for SR pilot runs')
 parser.add_argument('--lambda_latent', default=0.0, type=float, help='Latent L1 regularization coefficient (not in paper; default 0)')
+parser.add_argument('--lambda_f', default=0.0, type=float, help='Explicit frequency-alignment loss coefficient')
 parser.add_argument('--attack_only_fake', default=1, type=int, help='If 1, only craft adversarial examples for fake images')
 parser.add_argument('--max_per_source', default=0, type=int, help='If >0, sample up to N fake images per generator/source (paper: 100)')
 parser.add_argument('--seed', default=42, type=int, help='Random seed used for sampling')

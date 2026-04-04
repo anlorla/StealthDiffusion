@@ -25,9 +25,13 @@ from diffusers.models.autoencoder_kl import (
     DecoderOutput,
 )
 from ControlVAE import NewEncoder, NewDecoder, NewAutoencoderKL
+from models.network_dncnn import DnCNN as DnCNNNet
 import torchattacks
 from cross_attn_regularizer import CrossAttentionRegularizer
 from self_attn_regularizer import SelfAttentionRegularizer
+
+
+_DNCNN_RESIDUAL_CACHE: dict[str, torch.nn.Module] = {}
 
 
 # --------------------------------------------
@@ -599,6 +603,76 @@ def tensor_image_to_uint8(image_tensor):
     ).astype(np.uint8)
 
 
+def neg1pos1_to_01(image_tensor):
+    return ((image_tensor.float() + 1.0) * 0.5).clamp(0.0, 1.0)
+
+
+def rgb01_to_gray(image_tensor):
+    return (
+        0.2989 * image_tensor[:, 0, :, :]
+        + 0.5870 * image_tensor[:, 1, :, :]
+        + 0.1140 * image_tensor[:, 2, :, :]
+    )
+
+
+def spectrum_log_amplitude_torch(gray_01):
+    freq = torch.fft.fft2(gray_01.float(), dim=(-2, -1))
+    freq = torch.fft.fftshift(freq, dim=(-2, -1))
+    return torch.log1p(torch.abs(freq))
+
+
+def load_dncnn_residual_extractor(device):
+    device = torch.device(device)
+    cache_key = str(device)
+    cached = _DNCNN_RESIDUAL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    checkpoint_path = Path("/root/gpufree-data/checkpoints/dncnn_color_blind.pth")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Missing DnCNN checkpoint: {checkpoint_path}")
+
+    state = torch.load(str(checkpoint_path), map_location="cpu")
+    first_weight = next(v for k, v in state.items() if k.endswith(".weight") and v.ndim == 4)
+    last_weight = next(v for k, v in reversed(list(state.items())) if k.endswith(".weight") and v.ndim == 4)
+    num_convs = sum(1 for k, v in state.items() if k.endswith(".weight") and v.ndim == 4)
+    act_mode = "BR" if any(k.endswith("running_mean") for k in state) else "R"
+
+    model = DnCNNNet(
+        in_nc=int(first_weight.shape[1]),
+        out_nc=int(last_weight.shape[0]),
+        nc=int(first_weight.shape[0]),
+        nb=int(num_convs),
+        act_mode=act_mode,
+    )
+    model.load_state_dict(state, strict=True)
+    model = model.to(device).eval()
+    model.requires_grad_(False)
+    _DNCNN_RESIDUAL_CACHE[cache_key] = model
+    return model
+
+
+def compute_frequency_alignment_loss(pred_image, target_image, residual_extractor):
+    pred_01 = neg1pos1_to_01(pred_image)
+    target_01 = neg1pos1_to_01(target_image)
+
+    pred_spec = spectrum_log_amplitude_torch(rgb01_to_gray(pred_01))
+    target_spec = spectrum_log_amplitude_torch(rgb01_to_gray(target_01))
+    img_freq_loss = F.mse_loss(pred_spec, target_spec)
+
+    if residual_extractor is None:
+        zero = torch.zeros((), device=pred_image.device, dtype=img_freq_loss.dtype)
+        return img_freq_loss, img_freq_loss, zero
+
+    pred_residual = residual_extractor(pred_01)
+    target_residual = residual_extractor(target_01)
+    pred_residual_spec = spectrum_log_amplitude_torch(rgb01_to_gray(pred_residual))
+    target_residual_spec = spectrum_log_amplitude_torch(rgb01_to_gray(target_residual))
+    residual_freq_loss = F.mse_loss(pred_residual_spec, target_residual_spec)
+    total_freq_loss = 0.5 * (img_freq_loss + residual_freq_loss)
+    return total_freq_loss, img_freq_loss, residual_freq_loss
+
+
 def decode_latent_batch(model, latents, init_image, init_mask, diffusion_res, res, vae_dtype):
     decode_latents = (latents.detach() / get_scaling_factor(model)).to(dtype=vae_dtype)
     decode_latents = torch.nan_to_num(
@@ -971,10 +1045,15 @@ def diffattack(
 
     self_attn_weight = float(getattr(args, "self_attn_loss_weight", 0.0))
     cross_attn_weight = float(getattr(args, "cross_attn_loss_weight", 0.0))
+    lambda_f = float(getattr(args, "lambda_f", 0.0))
     cross_attn_regularizer = None
     cross_attn_loss = torch.tensor(0.0, device=device)
     self_attn_regularizer = None
     self_attn_loss = torch.tensor(0.0, device=device)
+    frequency_residual_extractor = None
+    if lambda_f > 0:
+        frequency_residual_extractor = load_dncnn_residual_extractor(device)
+        logger.info(f"[FREQ-LOSS] enabled lambda_f={lambda_f:.4f}")
 
     # 预处理后的图像也做一次 nan_to_num，避免后面参与 loss 出问题
     if freqsep_enabled:
@@ -1170,6 +1249,16 @@ def diffattack(
         lpips_loss = lpips(init_image_compare.float(), metric_out_image.float()).mean()
         l1_loss_val = loss_l1(init_image_compare, metric_out_image)
         l1_loss_latent = loss_l1(original_latent.float(), latent_opt)
+        if lambda_f > 0:
+            freq_loss, img_freq_loss, residual_freq_loss = compute_frequency_alignment_loss(
+                metric_out_image,
+                init_image_compare,
+                frequency_residual_extractor,
+            )
+        else:
+            freq_loss = torch.tensor(0.0, device=device)
+            img_freq_loss = torch.tensor(0.0, device=device)
+            residual_freq_loss = torch.tensor(0.0, device=device)
 
         out_image = (metric_out_image / 2 + 0.5).clamp(0, 1)
 
@@ -1192,6 +1281,7 @@ def diffattack(
             + lambda_l1 * l1_loss_val
             + lambda_lpips * lpips_loss
             + lambda_latent * l1_loss_latent
+            + lambda_f * freq_loss
             + cross_attn_weight * cross_attn_loss
             + self_attn_weight * self_attn_loss
         )
@@ -1215,6 +1305,9 @@ def diffattack(
                 f"l1_loss: {l1_loss_val.item():.5f} "
                 f"l1_loss_latent: {l1_loss_latent.item():.5f} "
                 f"lpips_loss: {lpips_loss.item():.5f} "
+                f"freq_loss: {freq_loss.item():.5f} "
+                f"img_freq_loss: {img_freq_loss.item():.5f} "
+                f"residual_freq_loss: {residual_freq_loss.item():.5f} "
                 f"cross_attn_loss: {float(cross_attn_loss.item()):.5f} "
                 f"self_attn_loss: {float(self_attn_loss.item()):.5f} "
                 f"loss: {loss.item():.5f}"
