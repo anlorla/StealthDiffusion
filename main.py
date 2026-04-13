@@ -136,6 +136,27 @@ parser.add_argument('--cross_attn_max_layers', default=5, type=int, help='Maximu
 parser.add_argument('--self_attn_loss_weight', default=0.0, type=float, help='Self-attention preservation loss weight (gamma)')
 parser.add_argument('--self_attn_layers', default='', type=str, help='Comma-separated self-attention layer names or PixArt block ids')
 parser.add_argument('--self_attn_max_layers', default=5, type=int, help='Maximum number of representative self-attention layers to regularize')
+parser.add_argument(
+    '--attn_schedule_mode',
+    default='fixed',
+    choices=[
+        'fixed',
+        'fixed_self_only',
+        'fixed_cross_only',
+        'two_stage_self_to_cross',
+        'two_stage_cross_to_self',
+        'linear_self_to_cross',
+        'linear_cross_to_self',
+    ],
+    type=str,
+    help='Iteration-wise schedule for combining self-attn and cross-attn objectives.',
+)
+parser.add_argument(
+    '--attn_schedule_switch_ratio',
+    default=0.5,
+    type=float,
+    help='Switch point ratio for two-stage attention schedules.',
+)
 
 def seed_torch(seed=42):
     """For reproducibility"""

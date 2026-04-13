@@ -664,6 +664,46 @@ def diffusion_step(model, latents, context, t, guidance_scale):
     return latents
 
 
+def resolve_attention_schedule_weights(
+    schedule_mode: str,
+    iteration_idx: int,
+    total_iterations: int,
+    self_attn_base_weight: float,
+    cross_attn_base_weight: float,
+    switch_ratio: float = 0.5,
+):
+    switch_ratio = float(max(0.0, min(1.0, switch_ratio)))
+    if total_iterations <= 1:
+        progress = 1.0
+    else:
+        progress = float(iteration_idx) / float(total_iterations - 1)
+
+    if schedule_mode == "fixed":
+        self_factor, cross_factor = 1.0, 1.0
+    elif schedule_mode == "fixed_self_only":
+        self_factor, cross_factor = 1.0, 0.0
+    elif schedule_mode == "fixed_cross_only":
+        self_factor, cross_factor = 0.0, 1.0
+    elif schedule_mode == "two_stage_self_to_cross":
+        self_factor, cross_factor = (1.0, 0.0) if progress < switch_ratio else (0.0, 1.0)
+    elif schedule_mode == "two_stage_cross_to_self":
+        self_factor, cross_factor = (0.0, 1.0) if progress < switch_ratio else (1.0, 0.0)
+    elif schedule_mode == "linear_self_to_cross":
+        self_factor, cross_factor = 1.0 - progress, progress
+    elif schedule_mode == "linear_cross_to_self":
+        self_factor, cross_factor = progress, 1.0 - progress
+    else:
+        raise ValueError(f"Unsupported attn_schedule_mode={schedule_mode!r}")
+
+    return {
+        "progress": progress,
+        "self_factor": float(self_factor),
+        "cross_factor": float(cross_factor),
+        "self_weight": float(self_attn_base_weight) * float(self_factor),
+        "cross_weight": float(cross_attn_base_weight) * float(cross_factor),
+    }
+
+
 def latent2image(vae, latents, args, decoder, down_features):
     scaling_factor = float(getattr(vae.config, "scaling_factor", 0.18215) or 0.18215)
     if args.is_encoder == 1:
@@ -979,8 +1019,10 @@ def diffattack(
     loss_l1 = torch.nn.L1Loss()
     lpips = load_lpips_metric(device)
 
-    self_attn_weight = float(getattr(args, "self_attn_loss_weight", 0.0))
-    cross_attn_weight = float(getattr(args, "cross_attn_loss_weight", 0.0))
+    self_attn_base_weight = float(getattr(args, "self_attn_loss_weight", 0.0))
+    cross_attn_base_weight = float(getattr(args, "cross_attn_loss_weight", 0.0))
+    attn_schedule_mode = str(getattr(args, "attn_schedule_mode", "fixed"))
+    attn_schedule_switch_ratio = float(getattr(args, "attn_schedule_switch_ratio", 0.5))
     lambda_f = float(getattr(args, "lambda_f", 0.0))
     cross_attn_regularizer = None
     cross_attn_loss = torch.tensor(0.0, device=device)
@@ -1048,24 +1090,51 @@ def diffattack(
         "norm_num_groups": params["norm_num_groups"],
     }
 
-    if cross_attn_weight > 0:
+    schedule_uses_self = attn_schedule_mode in {
+        "fixed",
+        "fixed_self_only",
+        "two_stage_self_to_cross",
+        "two_stage_cross_to_self",
+        "linear_self_to_cross",
+        "linear_cross_to_self",
+    }
+    schedule_uses_cross = attn_schedule_mode in {
+        "fixed",
+        "fixed_cross_only",
+        "two_stage_self_to_cross",
+        "two_stage_cross_to_self",
+        "linear_self_to_cross",
+        "linear_cross_to_self",
+    }
+    need_cross_attn_regularizer = cross_attn_base_weight > 0 and schedule_uses_cross
+    need_self_attn_regularizer = self_attn_base_weight > 0 and schedule_uses_self
+
+    logger.info(
+        "[ATTN-SCHEDULE] mode=%s switch_ratio=%.3f self_base_weight=%.4f cross_base_weight=%.4f",
+        attn_schedule_mode,
+        attn_schedule_switch_ratio,
+        self_attn_base_weight,
+        cross_attn_base_weight,
+    )
+
+    if need_cross_attn_regularizer:
         cross_attn_regularizer = CrossAttentionRegularizer.from_pixart(
             get_denoiser(model),
             token_indices=prompt_token_indices,
             layers=str(getattr(args, "cross_attn_layers", "")),
         )
         logger.info(
-            f"[CROSS-ATTN] enabled weight={cross_attn_weight:.4f} layers={cross_attn_regularizer.layer_names} token_indices={prompt_token_indices}"
+            f"[CROSS-ATTN] enabled base_weight={cross_attn_base_weight:.4f} layers={cross_attn_regularizer.layer_names} token_indices={prompt_token_indices}"
         )
 
-    if self_attn_weight > 0:
+    if need_self_attn_regularizer:
         self_attn_regularizer = SelfAttentionRegularizer.from_pixart(
             get_denoiser(model),
             layers=str(getattr(args, "self_attn_layers", "")),
             loss_type="fro",
         )
         logger.info(
-            f"[SELF-ATTN] enabled weight={self_attn_weight:.4f} layers={self_attn_regularizer.layer_names}"
+            f"[SELF-ATTN] enabled base_weight={self_attn_base_weight:.4f} layers={self_attn_regularizer.layer_names}"
         )
         with torch.no_grad():
             self_attn_regularizer.begin_reference()
@@ -1082,6 +1151,17 @@ def diffattack(
     for _iter, _ in enumerate(pbar):
         if mode == "Generate":
             break
+
+        attn_schedule = resolve_attention_schedule_weights(
+            schedule_mode=attn_schedule_mode,
+            iteration_idx=_iter,
+            total_iterations=iterations,
+            self_attn_base_weight=self_attn_base_weight,
+            cross_attn_base_weight=cross_attn_base_weight,
+            switch_ratio=attn_schedule_switch_ratio,
+        )
+        self_attn_weight = attn_schedule["self_weight"]
+        cross_attn_weight = attn_schedule["cross_weight"]
 
         # # 每一轮都重新作为 leaf，避免跨轮复用同一张图
         # latent_opt = latent_opt.detach().requires_grad_(True)
@@ -1221,6 +1301,8 @@ def diffattack(
                 f"freq_loss: {freq_loss.item():.5f} "
                 f"img_freq_loss: {img_freq_loss.item():.5f} "
                 f"residual_freq_loss: {residual_freq_loss.item():.5f} "
+                f"self_attn_weight: {self_attn_weight:.5f} "
+                f"cross_attn_weight: {cross_attn_weight:.5f} "
                 f"cross_attn_loss: {float(cross_attn_loss.item()):.5f} "
                 f"self_attn_loss: {float(self_attn_loss.item()):.5f} "
                 f"loss: {loss.item():.5f}"
@@ -1258,11 +1340,11 @@ def diffattack(
 
     if self_attn_regularizer is not None:
         logger.info(
-            f"[SELF-ATTN] final layers={self_attn_regularizer.layer_names} weight={self_attn_weight:.4f}"
+            f"[SELF-ATTN] final layers={self_attn_regularizer.layer_names} base_weight={self_attn_base_weight:.4f}"
         )
     if cross_attn_regularizer is not None:
         logger.info(
-            f"[CROSS-ATTN] final layers={cross_attn_regularizer.layer_names} weight={cross_attn_weight:.4f} token_indices={prompt_token_indices} calls={cross_attn_regularizer.call_counts}"
+            f"[CROSS-ATTN] final layers={cross_attn_regularizer.layer_names} base_weight={cross_attn_base_weight:.4f} token_indices={prompt_token_indices} calls={cross_attn_regularizer.call_counts}"
         )
 
     # ====== decode 成图像 ======

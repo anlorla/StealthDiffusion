@@ -201,6 +201,28 @@ RUN_SPECS = [
         "start_step": 18,
         "compared_to": "",
     },
+    {
+        "run_id": "pixart_startpoint_ddim_t19_surS",
+        "record_id": f"pixart_startpoint_ddim_t19_smoke35_surS_{DATE_TAG}",
+        "experiment_name": "PixArt-Alpha DDIM inversion t19 startpoint smoke35 surrogate S",
+        "primary_change": "startpoint_ddim_t19",
+        "startpoint_family": "ddim",
+        "startpoint_value": "t_start_19",
+        "startpoint_mode": "ddim_inversion",
+        "start_step": 19,
+        "compared_to": "",
+    },
+    {
+        "run_id": "pixart_startpoint_ddim_t20_surS",
+        "record_id": f"pixart_startpoint_ddim_t20_smoke35_surS_{DATE_TAG}",
+        "experiment_name": "PixArt-Alpha DDIM inversion t20 startpoint smoke35 surrogate S",
+        "primary_change": "startpoint_ddim_t20",
+        "startpoint_family": "ddim",
+        "startpoint_value": "t_start_20",
+        "startpoint_mode": "ddim_inversion",
+        "start_step": 20,
+        "compared_to": "",
+    },
 ]
 
 
